@@ -22,10 +22,10 @@ Both paths end with closing the issue and creating a git commit.
 
 ### Planning and plan review
 
-After issue review, the planner agent runs with read-only tools (`read`, `grep`, `find`, `ls`, `bash`) plus `questionnaire` (for clarifying questions) and `save_plan` (to submit the plan). When the planner calls `save_plan`, an editor opens with the plan prefilled:
+After issue review, the planner agent runs with read-only tools (`read`, `grep`, `find`, `ls`, `bash`) plus `questionnaire` (for clarifying questions) and `save_plan` (to submit the plan). When the planner calls `save_plan`, a scrollable plan viewer opens:
 
-- **Submit** (save and close) — accepts the plan and moves to implementation.
-- **Escape** — drops to a "Send instructions / Abort" prompt. Your instructions re-enter the planner in the same session, then the editor reopens. Repeat until satisfied.
+- **↵ accept** — moves to implementation.
+- **Escape** — drops to a "Send instructions / Abort" prompt. Your instructions re-enter the planner in the same session, then the viewer reopens. Repeat until satisfied.
 
 ### TDD path
 
@@ -61,6 +61,23 @@ pi -r -e ./agent/extensions/bogstandard
 ```
 
 `pi -r` resumes the last session. The extension restores phase state from `pi.appendEntry` records and reconnects to the in-progress issue.
+
+## Running under tmux
+
+Pi emits a startup warning when `extended-keys` is off:
+
+```
+Warning: tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and restart tmux.
+```
+
+To suppress it, add these two lines to `~/.tmux.conf` and restart tmux:
+
+```
+set -g extended-keys on
+set -g extended-keys-format csi-u
+```
+
+BogStandard only uses plain Enter, Escape, and single-letter keys, so it works correctly without this setting. The warning is about modified Enter variants (Ctrl+Enter, Shift+Enter, etc.) that BogStandard never binds.
 
 ## Running the tests
 
