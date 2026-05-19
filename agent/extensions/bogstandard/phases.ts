@@ -12,7 +12,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { IssueComment, IssueDetail } from "./chainlink.js";
+import type { IssueComment, IssueDetail } from "./db.js";
 
 export type Phase =
 	| "idle"
@@ -117,7 +117,7 @@ export function buildBsHeader(event: string, attrs: Record<string, string> = {})
 }
 
 /**
- * Parse the first line of a chainlink comment body as a BogStandard header.
+ * Parse the first line of a comment body as a BogStandard event header.
  * Returns a map of all key=value pairs (including `event`) or null if the line
  * is not a BogStandard header.
  */
@@ -161,7 +161,7 @@ function findLast<T>(arr: T[], pred: (e: T) => boolean): T | undefined {
 }
 
 /**
- * Reconstruct BogStandard phase state from chainlink comment history.
+ * Reconstruct BogStandard phase state from postgres comment history.
  *
  * Pure w.r.t. pi runtime — `gitShow` is injected so the function is
  * unit-testable without a real git process. Pass undefined to skip diff

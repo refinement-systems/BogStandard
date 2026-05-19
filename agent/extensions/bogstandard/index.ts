@@ -1,5 +1,5 @@
 /**
- * BogStandard — plan & implement chainlink issues end-to-end from pi.
+ * BogStandard — plan & implement issues end-to-end from pi.
  *
  * Replaces the bash `bogstandard` and `bogstandard-implement-issue`
  * orchestrators. Per-phase model selection and the TS test harness still
@@ -32,12 +32,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import {
 	buildIssueDisplay,
-	chainlinkAgentId,
-	chainlinkLocksClaim,
-	chainlinkLocksRelease,
-	chainlinkLocksSteal,
-	chainlinkLocksList,
-	chainlinkSessionWork,
+	configureDb,
+	getAgentId,
 	isLockStale,
 	type IssueDetail,
 	type IssueListEntry,
@@ -45,7 +41,12 @@ import {
 	issueClose,
 	issueComment,
 	issueShowJson,
-} from "./chainlink.js";
+	locksClaim,
+	locksList,
+	locksRelease,
+	locksSteal,
+} from "./db.js";
+import { loadConfig } from "./config.js";
 import { addAll, commit, currentBranch, hasStagedChanges, headShortSha, isClean, resetHardHeadMinus1, showHeadDiff } from "./git.js";
 import { formatIssueLabel, listEligible, pickFirstEligible } from "./issue-picker.js";
 import { type BogstandardState, type Phase, buildBsHeader, endReason, loadState, parseBsHeader, reconstructState, saveState } from "./phases.js";
@@ -131,8 +132,18 @@ export default function bogstandard(pi: ExtensionAPI) {
 			"Issue ID to work on (set by dispatch.sh to pre-assign workers; skips auto-pick). For interactive use, type '/bogstandard <id>' in the prompt instead.",
 		type: "string",
 	});
+	pi.registerFlag("bs-database-url", {
+		description:
+			"Postgres connection string (overrides BOGSTANDARD_DATABASE_URL and .bogstandard/config.json).",
+		type: "string",
+	});
+	pi.registerFlag("bs-agent-id", {
+		description:
+			"Agent id used for lock ownership (overrides BOGSTANDARD_AGENT_ID and .bogstandard/config.json). Distinct ids let multiple workers hold distinct locks against the same database.",
+		type: "string",
+	});
 	pi.registerFlag("bs-recover", {
-		description: "Force recovery from chainlink comment history, even if local state exists.",
+		description: "Force recovery from postgres comment history, even if local state exists.",
 		type: "boolean",
 	});
 	pi.registerFlag("bs-debug", {
@@ -205,7 +216,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("bogstandard", {
-		description: "Plan & implement the next chainlink issue (or the one whose id you pass)",
+		description: "Plan & implement the next eligible issue (or the one whose id you pass)",
 		getArgumentCompletions: async (prefix) => {
 			try {
 				const eligible = await listEligible(pi);
@@ -254,7 +265,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				try {
 					picked = await pickFirstEligible(pi);
 				} catch (err) {
-					ctx.ui.notify(`Failed to query chainlink: ${err}`, "error");
+					ctx.ui.notify(`Failed to query issues: ${err}`, "error");
 					return;
 				}
 				if (!picked) {
@@ -275,8 +286,8 @@ export default function bogstandard(pi: ExtensionAPI) {
 				const doRecover =
 					bsRecover ||
 					(await ctx.ui.confirm(
-						`Found an in-flight BogStandard run on issue #${issue.id} — recover from chainlink history?`,
-						"State will be rebuilt from chainlink comments. The working tree is left as-is.",
+						`Found an in-flight BogStandard run on issue #${issue.id} — recover from comment history?`,
+						"State will be rebuilt from the issue's comment log. The working tree is left as-is.",
 					));
 				if (doRecover) {
 					const gitShowFn = async (sha: string): Promise<string> => {
@@ -286,13 +297,13 @@ export default function bogstandard(pi: ExtensionAPI) {
 					state = await reconstructState(issue, gitShowFn);
 					persist();
 					// Claim the lock during recovery if we don't already hold it.
-					const recoveryAgentId = await chainlinkAgentId(pi);
+					const recoveryAgentId = await getAgentId(pi);
 					if (recoveryAgentId) {
-						const lf = await chainlinkLocksList(pi);
+						const lf = await locksList(pi);
 						const hasOurLock = lf?.locks[String(issue.id)]?.agent_id === recoveryAgentId;
 						if (!hasOurLock) {
 							try {
-								await chainlinkLocksClaim(pi, issue.id, await currentBranch(pi));
+								await locksClaim(pi, issue.id, await currentBranch(pi));
 							} catch (err) {
 								ctx.ui.notify(`Recovery: could not claim lock: ${err}`, "warning");
 							}
@@ -313,11 +324,10 @@ export default function bogstandard(pi: ExtensionAPI) {
 			}
 
 			// Claim the lock now that the user has confirmed this issue.
-			const claimAgentId = await chainlinkAgentId(pi);
+			const claimAgentId = await getAgentId(pi);
 			if (claimAgentId) {
 				try {
-					await chainlinkLocksClaim(pi, issue.id, await currentBranch(pi));
-					await chainlinkSessionWork(pi, issue.id);
+					await locksClaim(pi, issue.id, await currentBranch(pi));
 				} catch (err) {
 					ctx.ui.notify(`Could not claim lock on issue #${issue.id}: ${err}`, "error");
 					return;
@@ -342,7 +352,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				try {
 					const clean = await isClean(pi);
 					if (!clean) {
-						await chainlinkLocksRelease(pi, issue.id);
+						await locksRelease(pi, issue.id);
 						ctx.ui.notify(
 							"TDD path requires a clean working tree. Stash or commit your changes, then re-run /bogstandard.",
 							"error",
@@ -417,10 +427,10 @@ export default function bogstandard(pi: ExtensionAPI) {
 		ctx: ExtensionContext,
 		issueId: number,
 	): Promise<"ok" | "abort"> {
-		const myAgentId = await chainlinkAgentId(pi);
+		const myAgentId = await getAgentId(pi);
 		if (!myAgentId) return "ok"; // locks not configured — skip
 
-		const locksFile = await chainlinkLocksList(pi);
+		const locksFile = await locksList(pi);
 		if (!locksFile) return "ok"; // coordination branch unreachable — skip
 
 		const lockEntry = locksFile.locks[String(issueId)];
@@ -440,7 +450,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		}
 		// Steal
 		try {
-			await chainlinkLocksSteal(pi, issueId);
+			await locksSteal(pi, issueId);
 			ctx.ui.notify(`Stole lock on issue #${issueId}.`, "info");
 			return "ok";
 		} catch (err) {
@@ -468,7 +478,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 			});
 
 			if (action === "abort") {
-				if (issue) await chainlinkLocksRelease(pi, issue.id);
+				if (issue) await locksRelease(pi, issue.id);
 				ctx.ui.notify("Aborted before planning.", "info");
 				return false;
 			}
@@ -491,7 +501,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				try {
 					eligible = await listEligible(pi);
 				} catch (err) {
-					ctx.ui.notify(`Failed to query chainlink: ${err}`, "error");
+					ctx.ui.notify(`Failed to query issues: ${err}`, "error");
 					continue;
 				}
 				if (eligible.length === 0) {
@@ -604,7 +614,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 
 	async function postDurableComment(
 		ctx: ExtensionContext,
-		kind: import("./chainlink.js").CommentKind,
+		kind: import("./db.js").CommentKind,
 		event: string,
 		attrs: Record<string, string> = {},
 		body = "",
@@ -1064,7 +1074,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 			ctx.ui.notify(`Failed to close issue: ${err}`, "error");
 			return;
 		}
-		await chainlinkLocksRelease(pi, currentIssue.id);
+		await locksRelease(pi, currentIssue.id);
 		await postDurableComment(ctx, "resolution", "closed", {}, `Issue #${currentIssue.id} closed.`);
 
 		try {
@@ -1111,7 +1121,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 			);
 
 			if (!choice || choice === "Abort") {
-				await chainlinkLocksRelease(pi, issue.id);
+				await locksRelease(pi, issue.id);
 				ctx.ui.notify("Recovery aborted.", "info");
 				return false;
 			}
@@ -1165,6 +1175,21 @@ export default function bogstandard(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		try {
+			configureDb(
+				loadConfig({
+					projectRoot: process.cwd(),
+					flagDatabaseUrl: pi.getFlag("bs-database-url") as string | undefined,
+					flagAgentId: pi.getFlag("bs-agent-id") as string | undefined,
+				}),
+			);
+		} catch (err) {
+			ctx.ui.notify(
+				`bogstandard: postgres configuration not loaded — ${err instanceof Error ? err.message : String(err)}. Run 'npm run setup' to create .bogstandard/config.json.`,
+				"error",
+			);
+			return;
+		}
 		state = loadState(ctx);
 		if (state.issueId !== undefined && state.phase !== "idle" && state.phase !== "done") {
 			try {

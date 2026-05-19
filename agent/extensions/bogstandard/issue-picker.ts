@@ -1,103 +1,90 @@
 /**
- * Issue picker: port of `pick_first_issue_id` from the shell orchestrator.
+ * Issue picker, postgres-backed.
  *
- * Eligibility for picking:
- *   - status == "open"
+ * Eligibility:
+ *   - status = 'open'
  *   - no open subissues
- *   - no open blockers (every entry in `blocked_by` resolves to status != "open")
+ *   - no open blockers
  *
- * Sort order:
- *   - by priority (critical < high < medium < low < other)
- *   - then by id ascending
+ * Sort order: priority (critical → high → medium → low → other) then id.
+ * Everything is done in a single SQL query rather than the N+1 loop the
+ * shell version used.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { type IssueDetail, type IssueListEntry, issueList, issueShowJson } from "./chainlink.js";
+import { getPool, type IssueDetail, type IssueListEntry } from "./db.js";
 
-const PRIORITY_RANK: Record<string, number> = {
-	critical: 0,
-	high: 1,
-	medium: 2,
-	low: 3,
-};
-
-function priorityRank(priority: string | undefined): number {
-	if (priority && priority in PRIORITY_RANK) {
-		return PRIORITY_RANK[priority];
-	}
-	return 4;
+/**
+ * Minimal query interface used by `listEligibleWith`. Anything with a
+ * compatible `.query(text, params)` signature works — including `pg.Pool`
+ * and the stub used in unit tests.
+ */
+export interface QueryRunner {
+	query<R extends Record<string, unknown>>(
+		text: string,
+		params?: unknown[],
+	): Promise<{ rows: R[] }>;
 }
 
-function sortByPriorityThenId<T extends { id: number; priority?: string }>(issues: T[]): T[] {
-	return [...issues].sort((a, b) => {
-		const pa = priorityRank(a.priority);
-		const pb = priorityRank(b.priority);
-		if (pa !== pb) return pa - pb;
-		return a.id - b.id;
-	});
-}
+export const ELIGIBLE_SQL = `
+	SELECT i.id, i.title, i.priority, i.status
+	  FROM issues i
+	 WHERE i.status = 'open'
+	   AND NOT EXISTS (
+	         SELECT 1
+	           FROM dependencies d
+	           JOIN issues b ON d.blocker_id = b.id
+	          WHERE d.blocked_id = i.id AND b.status = 'open')
+	   AND NOT EXISTS (
+	         SELECT 1
+	           FROM issues s
+	          WHERE s.parent_id = i.id AND s.status = 'open')
+	 ORDER BY CASE i.priority
+	            WHEN 'critical' THEN 0
+	            WHEN 'high'     THEN 1
+	            WHEN 'medium'   THEN 2
+	            WHEN 'low'      THEN 3
+	            ELSE 4
+	          END, i.id
+`;
 
-async function isEligible(pi: ExtensionAPI, issueId: number, signal?: AbortSignal): Promise<boolean> {
-	const detail = await issueShowJson(pi, issueId, signal);
-
-	if ((detail.subissues ?? []).some((sub) => sub.status === "open")) {
-		return false;
-	}
-
-	for (const blockerId of detail.blocked_by ?? []) {
-		const blocker = await issueShowJson(pi, blockerId, signal);
-		if (blocker.status === "open") {
-			return false;
-		}
-	}
-
-	return true;
+interface EligibleRow extends Record<string, unknown> {
+	id: string | number;
+	title: string;
+	priority: string;
+	status: string;
 }
 
 /**
- * Return all eligible open issues, sorted by priority then id.
- *
- * Note: this performs one `issue show --json` per open issue (to check
- * subissues + blockers), matching today's shell behavior. For repos with
- * many open issues this is O(N) chainlink calls.
+ * Pure-ish: run the eligibility query against a caller-supplied runner.
+ * Exposed for unit tests that pass in a stub query function.
  */
-export async function listEligible(pi: ExtensionAPI, signal?: AbortSignal): Promise<IssueListEntry[]> {
-	const all = await issueList(pi, signal);
-	const open = all.filter((i) => i.status === "open");
-	const sorted = sortByPriorityThenId(open);
-
-	const eligible: IssueListEntry[] = [];
-	for (const issue of sorted) {
-		if (await isEligible(pi, issue.id, signal)) {
-			eligible.push(issue);
-		}
-	}
-	return eligible;
+export async function listEligibleWith(runner: QueryRunner): Promise<IssueListEntry[]> {
+	const result = await runner.query<EligibleRow>(ELIGIBLE_SQL);
+	return result.rows.map((r) => ({
+		id: Number(r.id),
+		title: r.title,
+		status: r.status,
+		priority: r.priority,
+	}));
 }
 
-/**
- * Pick the first eligible issue, or `undefined` if none exists.
- * Short-circuits after the first match, so it's cheaper than `listEligible`
- * when callers only want the auto-pick.
- */
+export async function listEligible(
+	_pi: ExtensionAPI,
+	_signal?: AbortSignal,
+): Promise<IssueListEntry[]> {
+	return listEligibleWith(getPool());
+}
+
 export async function pickFirstEligible(
 	pi: ExtensionAPI,
 	signal?: AbortSignal,
 ): Promise<IssueListEntry | undefined> {
-	const all = await issueList(pi, signal);
-	const open = all.filter((i) => i.status === "open");
-	const sorted = sortByPriorityThenId(open);
-
-	for (const issue of sorted) {
-		if (await isEligible(pi, issue.id, signal)) {
-			return issue;
-		}
-	}
-	return undefined;
+	const all = await listEligible(pi, signal);
+	return all[0];
 }
 
 /**
- * Format an issue for the autocomplete/picker UI.
  *   "#42 critical — Issue title"
  */
 export function formatIssueLabel(issue: IssueListEntry | IssueDetail): string {

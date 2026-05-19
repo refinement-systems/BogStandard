@@ -9,9 +9,9 @@
 #   pi-args    Extra flags forwarded to every pi invocation, e.g.:
 #              -- --bs-plan-model openrouter/deepseek/deepseek-v4-flash
 #
-# Each worker gets its own git worktree and branch. The .chainlink directory
-# is symlinked from the main checkout into each worktree so all workers share
-# the same issue database.
+# Each worker gets its own git worktree and branch. Each worktree gets its own
+# .bogstandard/config.json with a per-worker agent_id ("worker-${i}") so the
+# workers hold distinct postgres locks against the shared database.
 #
 # --cleanup removes all bogstandard/worker-* branches and worktrees created
 # by a previous dispatch run.
@@ -19,10 +19,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXT_PATH="${SCRIPT_DIR}/agent/extensions/bogstandard"
+BS_LIST_ELIGIBLE="${SCRIPT_DIR}/bin/bs-list-eligible"
 
 # --- dependency checks -------------------------------------------------------
 
-for cmd in git chainlink jq tmux; do
+for cmd in git node npx tmux; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "error: $cmd is required but not found on PATH" >&2
         exit 1
@@ -32,6 +33,7 @@ done
 REPO_ROOT=$(git rev-parse --show-toplevel)
 REPO_NAME=$(basename "$REPO_ROOT")
 REPO_PARENT=$(dirname "$REPO_ROOT")
+CONFIG_FILE="${REPO_ROOT}/.bogstandard/config.json"
 
 # --- --cleanup mode ----------------------------------------------------------
 
@@ -81,26 +83,28 @@ if [[ "$N" -eq 0 ]]; then
     exit 0
 fi
 
+# --- read parent config ------------------------------------------------------
+# We need the database_url so we can stamp each worker config.json with the
+# same connection. The agent_id is overridden per worker, so we ignore the
+# parent's value here.
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "error: ${CONFIG_FILE} not found." >&2
+    echo "From inside this project, run: ${SCRIPT_DIR}/bin/bs-setup --database-url <url>" >&2
+    exit 1
+fi
+
+DATABASE_URL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('${CONFIG_FILE}','utf8')).database_url)")
+STALE_TIMEOUT=$(node -e "const c=JSON.parse(require('fs').readFileSync('${CONFIG_FILE}','utf8')); console.log(c.stale_lock_timeout_minutes ?? 60)")
+
+if [[ -z "$DATABASE_URL" || "$DATABASE_URL" == "undefined" ]]; then
+    echo "error: ${CONFIG_FILE} has no database_url" >&2
+    exit 1
+fi
+
 # --- collect eligible issues -------------------------------------------------
-# Mirror BogStandard's eligibility: chainlink ready (no open blockers) AND
-# no open subissues. chainlink ready only checks blockers, so we verify
-# subissues ourselves via chainlink show --json for each candidate.
 
-ISSUES=""
-COUNT=0
-while IFS= read -r cand_id; do
-    [[ -z "$cand_id" ]] && continue
-    [[ $COUNT -ge $N ]] && break
-    OPEN_SUBS=$(chainlink show --json "$cand_id" 2>/dev/null \
-        | jq '([.subissues // [] | .[] | select(.status == "open")] | length)' 2>/dev/null \
-        || echo "0")
-    if [[ "$OPEN_SUBS" == "0" ]]; then
-        ISSUES+="${cand_id}"$'\n'
-        COUNT=$((COUNT + 1))
-    fi
-done < <(chainlink ready --json 2>/dev/null | jq -r '.[].id' 2>/dev/null || true)
-
-ISSUES=$(printf '%s' "$ISSUES" | grep -v '^$')
+ISSUES=$("$BS_LIST_ELIGIBLE" --limit "$N" 2>/dev/null || true)
 
 if [[ -z "$ISSUES" ]]; then
     echo "No eligible issues found." >&2
@@ -125,30 +129,27 @@ while IFS= read -r issue_id; do
     WORKTREE="${REPO_PARENT}/${REPO_NAME}-worker-${i}"
     BRANCH="bogstandard/worker-${i}/issue-${issue_id}"
     WIN_NAME="worker-${i}:#${issue_id}"
+    AGENT_ID="worker-${i}"
 
     echo "Worker $i: issue #${issue_id} → ${WORKTREE} (${BRANCH})"
 
-    # Create worktree + branch off main
     git worktree add -b "$BRANCH" "$WORKTREE" main
 
-    # Symlink .chainlink so the worker shares the issue database.
-    # .chainlink is gitignored so it won't exist in the fresh worktree.
-    if [[ -e "${REPO_ROOT}/.chainlink" ]]; then
-        ln -s "${REPO_ROOT}/.chainlink" "${WORKTREE}/.chainlink"
-        # Exclude .chainlink from git's view in this worktree so it doesn't
-        # show up as untracked and dirty the working tree.
-        WORKTREE_GIT_DIR=$(git -C "$WORKTREE" rev-parse --git-dir)
-        mkdir -p "${WORKTREE_GIT_DIR}/info"
-        echo ".chainlink" >> "${WORKTREE_GIT_DIR}/info/exclude"
-    fi
+    # Write a per-worktree config: same database URL as the parent, but a
+    # distinct agent_id so this worker holds its own postgres locks. The
+    # .bogstandard directory is gitignored so it stays out of the worktree's
+    # commit history.
+    mkdir -p "${WORKTREE}/.bogstandard"
+    cat > "${WORKTREE}/.bogstandard/config.json" <<EOF
+{
+  "database_url": "${DATABASE_URL}",
+  "agent_id": "${AGENT_ID}",
+  "stale_lock_timeout_minutes": ${STALE_TIMEOUT}
+}
+EOF
 
-    # Build the pi invocation.
-    # The issue id is passed as --bs-issue-id, NOT as a positional arg after
-    # /bogstandard. pi's CLI parser puts every non-flag token in a separate
-    # "messages" array: "pi ... /bogstandard 207" produces messages=["/bogstandard","207"],
-    # so the command handler always receives args="" and auto-picks. Passing it
-    # as a registered --flag puts it in unknownFlags, which the extension reads
-    # via pi.getFlag("bs-issue-id").
+    # Build the pi invocation. --bs-issue-id pre-assigns the issue so workers
+    # don't race for the auto-pick.
     CMD="pi -e '${EXT_PATH}' --bs-issue-id ${issue_id}"
     if [[ ${#PI_ARGS[@]} -gt 0 ]]; then
         CMD="${CMD} ${PI_ARGS[*]}"
@@ -156,12 +157,10 @@ while IFS= read -r issue_id; do
     CMD="${CMD} /bogstandard"
 
     if [[ "$first" -eq 1 ]]; then
-        # Reuse the window created by new-session
         tmux rename-window -t "${SESSION}:0" "$WIN_NAME"
         tmux send-keys -t "${SESSION}:0" "cd '${WORKTREE}' && ${CMD}" Enter
         first=0
     else
-        # New window, start directory set to worktree
         tmux new-window -t "$SESSION" -n "$WIN_NAME" -c "$WORKTREE"
         tmux send-keys -t "$SESSION" "${CMD}" Enter
     fi

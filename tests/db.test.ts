@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { IssueDetail, LockEntry } from "../agent/extensions/bogstandard/chainlink.js";
-import { buildIssueDisplay, isLockStale } from "../agent/extensions/bogstandard/chainlink.js";
+import type { IssueDetail, LockEntry } from "../agent/extensions/bogstandard/db.js";
+import { buildIssueDisplay, isLockStale } from "../agent/extensions/bogstandard/db.js";
 
 function issue(overrides: Partial<IssueDetail> = {}): IssueDetail {
 	return { id: 1, title: "Test Issue", status: "open", ...overrides };
@@ -19,21 +19,21 @@ describe("isLockStale", () => {
 	const SIXTY_MIN = 60;
 
 	it("fresh lock is not stale", () => {
-		expect(isLockStale(makeLock(60_000), SIXTY_MIN)).toBe(false); // 1 min ago
+		expect(isLockStale(makeLock(60_000), SIXTY_MIN)).toBe(false);
 	});
 
 	it("old lock is stale", () => {
-		expect(isLockStale(makeLock(90 * 60_000), SIXTY_MIN)).toBe(true); // 90 min ago
+		expect(isLockStale(makeLock(90 * 60_000), SIXTY_MIN)).toBe(true);
 	});
 
-	it("exactly at boundary is stale (strict >)", () => {
-		expect(isLockStale(makeLock(SIXTY_MIN * 60_000), SIXTY_MIN)).toBe(false); // exactly 60 min → not stale
-		expect(isLockStale(makeLock(SIXTY_MIN * 60_000 + 1), SIXTY_MIN)).toBe(true); // 1 ms over → stale
+	it("exactly at boundary is not stale (strict >)", () => {
+		expect(isLockStale(makeLock(SIXTY_MIN * 60_000), SIXTY_MIN)).toBe(false);
+		expect(isLockStale(makeLock(SIXTY_MIN * 60_000 + 1), SIXTY_MIN)).toBe(true);
 	});
 
 	it("respects custom timeout", () => {
-		expect(isLockStale(makeLock(6 * 60_000), 5)).toBe(true);  // 6 min, 5-min timeout → stale
-		expect(isLockStale(makeLock(4 * 60_000), 5)).toBe(false); // 4 min, 5-min timeout → fresh
+		expect(isLockStale(makeLock(6 * 60_000), 5)).toBe(true);
+		expect(isLockStale(makeLock(4 * 60_000), 5)).toBe(false);
 	});
 });
 

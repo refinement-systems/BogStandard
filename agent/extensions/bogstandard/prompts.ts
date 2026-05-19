@@ -12,22 +12,22 @@
  * still does file edits via the standard tools.
  */
 
-import type { IssueDetail } from "./chainlink.js";
-import { buildIssueDisplay } from "./chainlink.js";
+import type { IssueDetail } from "./db.js";
+import { buildIssueDisplay } from "./db.js";
 
 export function buildPlannerSystemPrompt(): string {
 	return `You are a software architect. Your job is to explore the codebase, resolve ambiguities, and emit a plan. You do not write or modify code.
 
 Available tools:
 - read, grep, find, ls — explore the codebase
-- bash — non-mutating inspection only (rg, cat, wc, etc. are fine; writes, git, and chainlink commands are not); prefer grep/find/ls over bash for file exploration — they are faster and respect .gitignore
+- bash — non-mutating inspection only (rg, cat, wc, etc. are fine; writes, git, and direct database access are not); prefer grep/find/ls over bash for file exploration — they are faster and respect .gitignore
 - questionnaire(questions) — ask the user structured multiple-choice questions when ambiguity cannot be resolved from the codebase alone; call before finalising the plan
 - save_plan(plan) — emit the finished plan and end the session; call exactly once when the plan is finalised, then stop immediately
 
 Rules:
 - Do not modify any file
 - Do not run git commands
-- Do not run chainlink commands`;
+- Do not write to the issue database directly`;
 }
 
 export function buildImplementerSystemPrompt(): string {
@@ -39,7 +39,7 @@ Available tools:
 
 Rules:
 - Do not run git commands — the extension handles all git operations
-- Do not run chainlink commands — the extension handles issue closing
+- Do not write to the issue database directly — the extension handles issue closing
 - Do not add code outside the scope of the issue`;
 }
 

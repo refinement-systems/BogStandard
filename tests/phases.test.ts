@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { IssueComment, IssueDetail } from "../agent/extensions/bogstandard/chainlink.js";
+import type { IssueComment, IssueDetail } from "../agent/extensions/bogstandard/db.js";
 import type { BogstandardPhaseEntry, BogstandardState } from "../agent/extensions/bogstandard/phases.js";
 import { buildBsHeader, loadState, reconstructState, saveState } from "../agent/extensions/bogstandard/phases.js";
 

@@ -5,9 +5,19 @@
   "private": true,
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "setup": "tsx scripts/setup.ts",
+    "migrate": "tsx scripts/migrate-from-chainlink.ts"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/pg": "^8.11.10",
+    "better-sqlite3": "^11.7.0",
+    "tsx": "^4.19.2",
+    "typescript": "^6.0.3",
     "vitest": "^3.2.4"
   }
 }

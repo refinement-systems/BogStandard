@@ -6,7 +6,7 @@ The swamp level of agent orchestrators.
 
 BogStandard is a pi extension and an orchestrator script.
 
-* The extension automates a two-phase `plan → implement` loop for Chainlink issues. It runs as a [pi](https://github.com/earendil-works/pi) extension: a single `/bogstandard` command drives issue review, planning (with interactive refinement), optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
+* The extension automates a two-phase `plan → implement` loop for issues stored in a managed Postgres database. It runs as a [pi](https://github.com/earendil-works/pi) extension: a single `/bogstandard` command drives issue review, planning (with interactive refinement), optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
 * The script runs multiple sessions in parallel, picking the appropriate issues.
 
 NOTE: while the extension is okay-ish, the dispatch.sh is very WIP and should not be used for any valuable projects.
@@ -14,12 +14,55 @@ NOTE: while the extension is okay-ish, the dispatch.sh is very WIP and should no
 ## Requirements
 
 - [`pi`](https://github.com/earendil-works/pi) (the coding agent)
-- `chainlink`
 - `git`
+- A reachable PostgreSQL server (local or remote)
+- Node.js 20+
+
+## Install BogStandard
+
+You install BogStandard *once*, in its own checkout — target projects don't need their own `package.json` or `npm install`. From this repo's root:
+
+```bash
+npm install
+```
+
+Optionally put BogStandard's `bin/` directory on your `PATH` so the wrappers below are reachable by short name:
+
+```bash
+export PATH="/path/to/BogStandard/bin:$PATH"
+```
+
+If you prefer not to extend `PATH`, call the wrappers by absolute path (`/path/to/BogStandard/bin/bs-setup …`).
+
+## Set up a target project
+
+`cd` into your target project (it does not need to be JavaScript or have a `package.json`) and run:
+
+```bash
+bs-setup --database-url postgres://localhost:5432/bogstandard_myproject
+```
+
+This creates the database if it doesn't already exist, applies the schema (`db/migrations/0001_init.sql`), and writes `.bogstandard/config.json` in the **target project's** directory with the connection string and a default `agent_id`. Make sure `.bogstandard/` is gitignored in your target project (or in your global gitignore).
+
+If the target project previously used chainlink, migrate the existing data:
+
+```bash
+bs-migrate           # reads ./.chainlink/issues.db, writes to your postgres DB
+```
+
+The chainlink CLI and its `.chainlink/` directory are no longer used after migration.
+
+## Configuration
+
+The extension and scripts read `.bogstandard/config.json` for the postgres connection. Overrides, highest precedence first:
+
+1. CLI flags: `--bs-database-url <url>`, `--bs-agent-id <id>`
+2. Env vars: `BOGSTANDARD_DATABASE_URL`, `BOGSTANDARD_AGENT_ID`
+3. `.bogstandard/config.json`
 
 ## Usage
 
-Run from inside a chainlink-initialized git repo:
+Run from inside a project that has been set up:
 
 ```bash
 # Auto-pick the next eligible open issue
@@ -96,23 +139,17 @@ pi -r -e ./agent/extensions/bogstandard
 npm test
 ```
 
-102 unit tests covering `phases.ts`, `issue-picker.ts`, `prompts.ts`, `chainlink.ts`, and interrupt detection.
+Unit tests cover `phases.ts`, `issue-picker.ts`, `prompts.ts`, `db.ts`, `config.ts`, and interrupt detection.
 
 ## Development
 
-Clone the repo and run tests directly:
+Hacking on BogStandard itself (not just using it):
 
 ```bash
 git clone <repo-url> BogStandard
 cd BogStandard
 npm install
 npm test
-```
-
-Run the extension from the repo root against any chainlink-initialized project:
-
-```bash
-pi -e ./agent/extensions/bogstandard /bogstandard
 ```
 
 See [AGENTS.md](AGENTS.md) for architecture details, phase descriptions, and project structure.

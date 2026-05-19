@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { IssueDetail } from "../agent/extensions/bogstandard/chainlink.js";
+import type { IssueDetail } from "../agent/extensions/bogstandard/db.js";
 import {
 	buildGreenImplementPrompt,
 	buildGreenImplementerSystemPrompt,
@@ -165,8 +165,8 @@ describe("buildPlannerSystemPrompt", () => {
 		expect(buildPlannerSystemPrompt()).toContain("git");
 	});
 
-	it("prohibits chainlink commands", () => {
-		expect(buildPlannerSystemPrompt()).toContain("chainlink");
+	it("prohibits direct issue database access", () => {
+		expect(buildPlannerSystemPrompt()).toContain("issue database");
 	});
 });
 
@@ -179,8 +179,8 @@ describe("buildImplementerSystemPrompt", () => {
 		expect(buildImplementerSystemPrompt()).toContain("git");
 	});
 
-	it("prohibits chainlink commands", () => {
-		expect(buildImplementerSystemPrompt()).toContain("chainlink");
+	it("prohibits direct issue database access", () => {
+		expect(buildImplementerSystemPrompt()).toContain("issue database");
 	});
 });
 

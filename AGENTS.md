@@ -1,6 +1,44 @@
 # BogStandard
 
-BogStandard automates a two-phase plan→implement loop for Chainlink issues. It runs as a [pi](https://github.com/earendil-works/pi) extension: a single `/bogstandard` command drives the full flow — issue review, planning, optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
+BogStandard automates a two-phase plan→implement loop for issues tracked in a managed Postgres database. It runs as a [pi](https://github.com/earendil-works/pi) extension: a single `/bogstandard` command drives the full flow — issue review, planning, optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
+
+## One-time setup
+
+Install BogStandard once, inside its own checkout:
+
+```bash
+cd /path/to/BogStandard
+npm install
+```
+
+Then, from any target project (no `package.json` required), run the wrapper:
+
+```bash
+cd /path/to/your-project
+/path/to/BogStandard/bin/bs-setup --database-url postgres://localhost:5432/bogstandard_myproject
+```
+
+(Or put `BogStandard/bin` on your `PATH` and just say `bs-setup …`.)
+
+The wrapper creates the database if missing, runs `db/migrations/0001_init.sql`, and writes `.bogstandard/config.json` in the target project's directory — not in BogStandard's checkout. Make sure your target project gitignores `.bogstandard/`. The extension and scripts all read this file by default; flags and env vars override individual fields:
+
+| Source | Field | Notes |
+|---|---|---|
+| `--bs-database-url <url>` | `database_url` | Highest precedence |
+| `BOGSTANDARD_DATABASE_URL` | `database_url` | Env override |
+| `--bs-agent-id <id>` | `agent_id` | Per-invocation |
+| `BOGSTANDARD_AGENT_ID` | `agent_id` | Env override |
+| `.bogstandard/config.json` | `database_url`, `agent_id`, `stale_lock_timeout_minutes` | Default for the project |
+
+## Migrating from an existing chainlink project
+
+From the target project's directory:
+
+```bash
+/path/to/BogStandard/bin/bs-migrate         # defaults to ./.chainlink/issues.db
+```
+
+Copies issues, comments, dependencies, and the `agent.json` agent id into the new Postgres database. Refuses to run against a non-empty target unless `--force` is passed.
 
 ## Running the workflow
 
@@ -18,7 +56,7 @@ pi -e ./agent/extensions/bogstandard /bogstandard 42
 
 **Explicit issue** skips the auto-pick and goes straight to review for that issue.
 
-Both paths end with closing the issue and creating a git commit.
+Both paths end with closing the issue (`UPDATE issues SET status='closed'`) and creating a git commit. Closing an issue no longer touches CHANGELOG.md — only the git commit message reflects the change.
 
 ### Planning and plan review
 
@@ -62,6 +100,15 @@ pi -r -e ./agent/extensions/bogstandard
 
 `pi -r` resumes the last session. The extension restores phase state from `pi.appendEntry` records and reconnects to the in-progress issue.
 
+## Multi-worker dispatch
+
+`./dispatch.sh [N]` creates N git worktrees off `main`, writes a per-worktree `.bogstandard/config.json` with a distinct `agent_id` (`worker-1`, `worker-2`, …), and starts a pi session in each — all pointing at the same postgres database. Per-worker `agent_id`s let each session hold its own locks (one row per issue in the `locks` table).
+
+```bash
+./dispatch.sh 3 -- --bs-plan-model openrouter/deepseek/deepseek-v4-flash
+./dispatch.sh --cleanup    # tear down worktrees + branches
+```
+
 ## Running under tmux
 
 Pi emits a startup warning when `extended-keys` is off:
@@ -87,26 +134,39 @@ BogStandard only uses plain Enter, Escape, and single-letter keys, so it works c
 npm test
 ```
 
-Runs 114 unit tests covering the pure-logic modules:
+Runs unit tests covering the pure-logic modules:
 - `phases.ts` — state loading/saving and all phase transitions
-- `issue-picker.ts` — eligibility filtering and priority/id sort order
+- `issue-picker.ts` — eligibility SQL and row mapping (against a query-runner stub)
 - `prompts.ts` — all six prompt builders (no-tests, red plan, red impl, green plan, green impl)
-- `chainlink.ts` — `buildIssueDisplay` formatting
+- `db.ts` — `buildIssueDisplay` formatting and `isLockStale` boundary checks
+- `config.ts` — flag → env → file precedence
 - `phases.ts` (interrupt) — `endReason` session stop-reason detection
 - `scroll-math.ts` — scrollable-markdown viewer offset/page clamping
 
-End-to-end workflow testing (issue pick → plan → implement → commit) is done manually; the TUI-based review dialogs cannot be driven headlessly.
+SQL-touching paths (the eligibility query against a real database, lock claim/release/steal, comment insertion, issue close) are exercised manually via end-to-end smoke runs; the unit suite uses stub runners and pure helpers.
 
 ## Project structure
 
 ```
+bin/
+  bs-setup                     # Wrapper: run setup.ts against the caller's cwd
+  bs-migrate                   # Wrapper: run migration against the caller's cwd
+  bs-list-eligible             # Wrapper: print eligible issue ids for the caller's cwd
+db/
+  migrations/
+    0001_init.sql              # Initial postgres schema
+scripts/
+  setup.ts                     # Create DB if missing, apply schema, write config.json
+  migrate-from-chainlink.ts    # Copy issues/comments/dependencies from .chainlink/issues.db
+  list-eligible.ts             # Print eligible issue ids (used by dispatch.sh)
 agent/
   extensions/
     bogstandard/               # The pi extension (TypeScript)
       index.ts                   # Extension factory: command, tools, event handlers
-      chainlink.ts               # Typed wrappers over pi.exec("chainlink", ...)
+      config.ts                  # Flag/env/file config resolution
+      db.ts                      # Postgres adapter (replaces the old chainlink wrappers)
       git.ts                     # Typed wrappers over pi.exec("git", ...)
-      issue-picker.ts            # Port of pick_first_issue_id; eligibility + priority sort
+      issue-picker.ts            # Eligibility query (single SQL) + label formatting
       phases.ts                  # Phase state types, loadState / saveState
       prompts.ts                 # All six prompt builders (inline content, no temp files)
       questionnaire.ts           # Questionnaire tool for plan-phase clarifying questions
@@ -118,11 +178,13 @@ tests/
   run.sh                         # Thin wrapper that runs npm test
   phases.test.ts                 # Unit tests for phase state
   interrupt.test.ts              # Unit tests for endReason (session stop detection)
-  issue-picker.test.ts           # Unit tests for eligibility + sorting
+  issue-picker.test.ts           # Unit tests for the eligibility query + sorting
   prompts.test.ts                # Unit tests for prompt builders
-  chainlink.test.ts              # Unit tests for buildIssueDisplay
+  db.test.ts                     # Unit tests for buildIssueDisplay + isLockStale
+  config.test.ts                 # Unit tests for config precedence
   scroll-math.test.ts            # Unit tests for scroll-offset helpers
-package.json                   # vitest dev dependency
+package.json                   # vitest + pg + better-sqlite3 + tsx
+dispatch.sh                    # Multi-worker dispatcher (postgres-backed)
 vitest.config.ts
 tsconfig.json                  # For IDE type checking (noEmit)
 ```
