@@ -61,6 +61,7 @@ import {
 	buildRedPlanPrompt,
 } from "./prompts.js";
 import { registerQuestionnaireTool } from "./questionnaire.js";
+import { showScrollableMarkdown } from "./scrollable-markdown.js";
 
 const PLAN_TOOLS = ["read", "grep", "find", "ls", "bash", "questionnaire", "save_plan"];
 const IMPL_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"];
@@ -455,29 +456,24 @@ export default function bogstandard(pi: ExtensionAPI) {
 	 */
 	async function runIssueReviewLoop(_pi: ExtensionAPI, ctx: ExtensionContext): Promise<boolean> {
 		while (issue) {
-			pi.sendMessage(
-				{
-					customType: "bogstandard-issue",
-					content: `## ${formatIssueLabel(issue)}\n\n${buildIssueDisplay(issue)}`,
-					display: true,
-				},
-				{ triggerTurn: false },
-			);
+			const action = await showScrollableMarkdown<"continue" | "comment" | "show" | "abort">(ctx, {
+				title: `Issue #${issue.id} — ${formatIssueLabel(issue)}`,
+				markdown: buildIssueDisplay(issue),
+				actions: [
+					{ keyId: "return", label: "↵ continue", result: "continue" },
+					{ keyId: "c", label: "c comment", result: "comment" },
+					{ keyId: "s", label: "s show others", result: "show" },
+					{ keyId: "escape", label: "esc abort", result: "abort" },
+				],
+			});
 
-			const choice = await ctx.ui.select(`Issue #${issue.id} — what next?`, [
-				"Continue (plan & implement)",
-				"Add a comment",
-				"Show other open issues",
-				"Abort",
-			]);
-
-			if (!choice || choice === "Abort") {
+			if (action === "abort") {
 				if (issue) await chainlinkLocksRelease(pi, issue.id);
 				ctx.ui.notify("Aborted before planning.", "info");
 				return false;
 			}
 
-			if (choice.startsWith("Add")) {
+			if (action === "comment") {
 				const body = await ctx.ui.editor("Comment:", "");
 				if (body !== undefined && body.trim() !== "") {
 					try {
@@ -490,7 +486,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				continue;
 			}
 
-			if (choice.startsWith("Show")) {
+			if (action === "show") {
 				let eligible: IssueListEntry[];
 				try {
 					eligible = await listEligible(pi);
@@ -517,7 +513,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				continue;
 			}
 
-			// Continue.
+			// action === "continue"
 			return true;
 		}
 		return false;
@@ -556,14 +552,9 @@ export default function bogstandard(pi: ExtensionAPI) {
 	});
 
 	/**
-	 * Shared plan-review UI. Opens an editor with the current `state.plan`
-	 * prefilled; submit accepts (handing off to `onAccept`), Escape drops to
+	 * Shared plan-review UI. Renders the current `state.plan` as scrollable
+	 * markdown; Enter accepts (handing off to `onAccept`), Escape drops to
 	 * a small refine/abort select.
-	 *
-	 * The editor primitive is used because it's the only TUI element that
-	 * reliably renders long initial content to the user — `sendMessage({
-	 * display: true })` with custom-type messages routed through pi's default
-	 * renderer was unreliable in practice.
 	 */
 	async function reviewPlanUI(
 		ctx: ExtensionContext,
@@ -574,20 +565,21 @@ export default function bogstandard(pi: ExtensionAPI) {
 	): Promise<void> {
 		if (!issue || !state.plan) return;
 
-		const edited = await ctx.ui.editor(
-			`Plan for issue #${issue.id} — submit to accept, Escape to refine or abort:`,
-			state.plan,
-		);
+		const action = await showScrollableMarkdown<"accept" | "escape">(ctx, {
+			title: `Plan for issue #${issue.id}`,
+			markdown: state.plan,
+			actions: [
+				{ keyId: "return", label: "↵ accept", result: "accept" },
+				{ keyId: "escape", label: "esc refine / abort", result: "escape" },
+			],
+		});
 
-		if (edited !== undefined) {
-			const accepted = edited.trim() !== "" ? edited : state.plan;
-			state.plan = accepted;
-			persist();
-			await options.onAccept(accepted);
+		if (action === "accept") {
+			await options.onAccept(state.plan);
 			return;
 		}
 
-		// Editor cancelled. Offer refine or abort.
+		// Refine or abort.
 		const choice = await ctx.ui.select("Plan not accepted — what next?", [
 			"Send instructions to the planner",
 			"Abort",

@@ -70,12 +70,13 @@ pi -r -e ./agent/extensions/bogstandard
 npm test
 ```
 
-Runs 102 unit tests covering the pure-logic modules:
+Runs 114 unit tests covering the pure-logic modules:
 - `phases.ts` — state loading/saving and all phase transitions
 - `issue-picker.ts` — eligibility filtering and priority/id sort order
 - `prompts.ts` — all six prompt builders (no-tests, red plan, red impl, green plan, green impl)
 - `chainlink.ts` — `buildIssueDisplay` formatting
 - `phases.ts` (interrupt) — `endReason` session stop-reason detection
+- `scroll-math.ts` — scrollable-markdown viewer offset/page clamping
 
 End-to-end workflow testing (issue pick → plan → implement → commit) is done manually; the TUI-based review dialogs cannot be driven headlessly.
 
@@ -92,6 +93,8 @@ agent/
       phases.ts                  # Phase state types, loadState / saveState
       prompts.ts                 # All six prompt builders (inline content, no temp files)
       questionnaire.ts           # Questionnaire tool for plan-phase clarifying questions
+      scrollable-markdown.ts     # ScrollableMarkdownView component used by issue + plan review
+      scroll-math.ts             # Pure scroll-offset helpers (testable without pi runtime)
 reference/                     # Not tracked; open-source reference code
 draft/                         # Not checked out; implementation reference snippets
 tests/
@@ -101,6 +104,7 @@ tests/
   issue-picker.test.ts           # Unit tests for eligibility + sorting
   prompts.test.ts                # Unit tests for prompt builders
   chainlink.test.ts              # Unit tests for buildIssueDisplay
+  scroll-math.test.ts            # Unit tests for scroll-offset helpers
 package.json                   # vitest dev dependency
 vitest.config.ts
 tsconfig.json                  # For IDE type checking (noEmit)
