@@ -142,11 +142,18 @@ while IFS= read -r issue_id; do
         echo ".chainlink" >> "${WORKTREE_GIT_DIR}/info/exclude"
     fi
 
-    # Build the pi invocation
-    CMD="pi -e '${EXT_PATH}' /bogstandard ${issue_id}"
+    # Build the pi invocation.
+    # The issue id is passed as --bs-issue-id, NOT as a positional arg after
+    # /bogstandard. pi's CLI parser puts every non-flag token in a separate
+    # "messages" array: "pi ... /bogstandard 207" produces messages=["/bogstandard","207"],
+    # so the command handler always receives args="" and auto-picks. Passing it
+    # as a registered --flag puts it in unknownFlags, which the extension reads
+    # via pi.getFlag("bs-issue-id").
+    CMD="pi -e '${EXT_PATH}' --bs-issue-id ${issue_id}"
     if [[ ${#PI_ARGS[@]} -gt 0 ]]; then
         CMD="${CMD} ${PI_ARGS[*]}"
     fi
+    CMD="${CMD} /bogstandard"
 
     if [[ "$first" -eq 1 ]]; then
         # Reuse the window created by new-session

@@ -125,6 +125,11 @@ export default function bogstandard(pi: ExtensionAPI) {
 		description: "Model for the TDD green-phase implementer (provider/id). Overrides --bs-impl-model.",
 		type: "string",
 	});
+	pi.registerFlag("bs-issue-id", {
+		description:
+			"Issue ID to work on (set by dispatch.sh to pre-assign workers; skips auto-pick). For interactive use, type '/bogstandard <id>' in the prompt instead.",
+		type: "string",
+	});
 	pi.registerFlag("bs-recover", {
 		description: "Force recovery from chainlink comment history, even if local state exists.",
 		type: "boolean",
@@ -231,8 +236,12 @@ export default function bogstandard(pi: ExtensionAPI) {
 			}
 
 			// Resolve which issue to work on.
+			// --bs-issue-id takes precedence over the positional arg; dispatch.sh
+			// uses it because pi's CLI parser treats positional tokens after the
+			// command name as separate messages, not as command args.
 			let picked: IssueListEntry | undefined;
-			const arg = args.trim();
+			const flagIssueId = pi.getFlag("bs-issue-id") as string | undefined;
+			const arg = flagIssueId ?? args.trim();
 			if (arg !== "") {
 				const id = Number.parseInt(arg, 10);
 				if (Number.isNaN(id)) {
