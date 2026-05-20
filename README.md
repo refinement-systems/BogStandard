@@ -105,10 +105,10 @@ Requires a clean working tree before the red phase starts.
 
 ```bash
 pi -e ./agent/extensions/bogstandard \
-   --bs-plan-model       openrouter/deepseek/deepseek-v4-flash \
-   --bs-impl-model       anthropic/claude-opus-4-7 \
-   --bs-red-plan-model   openrouter/deepseek/deepseek-v4-flash \
-   --bs-green-impl-model anthropic/claude-opus-4-7 \
+   --bs-plan-model       openrouter/deepseek/deepseek-v4-pro \
+   --bs-impl-model       openrouter/deepseek/deepseek-v4-flash \
+   --bs-red-plan-model   openrouter/deepseek/deepseek-v4-pro \
+   --bs-green-impl-model openrouter/deepseek/deepseek-v4-flash \
    /bogstandard
 ```
 
