@@ -131,6 +131,121 @@ pi -r -e ./agent/extensions/bogstandard
 
 `pi -r` resumes the last session. The extension restores phase state and reconnects to the in-progress issue.
 
+## Multi-worker dispatch
+
+`dispatch.sh` spawns N parallel BogStandard workers, each in its own git worktree off `main` and its own tmux window, all pointing at the same postgres database. Each worktree gets a per-worker `.bogstandard/config.json` whose `agent_id` is set to `worker-1`, `worker-2`, … so the `locks` table can hold one row per concurrent worker without collisions.
+
+> Heads up: `dispatch.sh` is still rough — fine for this repo and toys, but don't aim it at anything you care about yet.
+
+Prereqs: `bs-setup` has already been run in this repo (so `.bogstandard/config.json` exists), and `tmux` is on `PATH`.
+
+```bash
+./dispatch.sh                    # 2 workers (default)
+./dispatch.sh 4                  # 4 workers
+./dispatch.sh 3 -- --bs-plan-model openrouter/deepseek/deepseek-v4-flash
+./dispatch.sh --cleanup          # remove worker worktrees + branches
+```
+
+Anything after `--` is forwarded verbatim to every `pi` invocation. The dispatcher reads eligible issue ids via `bs-list-eligible` and pre-assigns one to each worker with `--bs-issue-id`, so workers don't race on auto-pick.
+
+Workers run inside a tmux session named `bogstandard-dispatch-<pid>`. Detach with `Ctrl-b d`, re-attach with `tmux attach -t bogstandard-dispatch-<pid>`. When you're done, `./dispatch.sh --cleanup` removes the `bogstandard/worker-*` branches and their worktrees.
+
+## Inspecting the database
+
+There's no admin UI yet — during this early stage of the project, `psql` is the debugger. Connect using the URL from `.bogstandard/config.json`:
+
+```bash
+psql "$(node -e "console.log(JSON.parse(require('fs').readFileSync('.bogstandard/config.json','utf8')).database_url)")"
+```
+
+A small cookbook against the schema in `db/migrations/0001_init.sql`:
+
+**All open issues, ordered by priority then id**
+
+```sql
+SELECT id, priority, title
+  FROM issues
+ WHERE status = 'open'
+ ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                        WHEN 'medium'   THEN 2 WHEN 'low'  THEN 3 ELSE 4 END,
+          id;
+```
+
+**Ready / eligible issues** — open, no open subissues, no open blockers. This is the same query the auto-picker and `bs-list-eligible` use (see `ELIGIBLE_SQL` in `agent/extensions/bogstandard/issue-picker.ts`), so the result should match `bs-list-eligible` exactly:
+
+```sql
+SELECT i.id, i.title, i.priority, i.status
+  FROM issues i
+ WHERE i.status = 'open'
+   AND NOT EXISTS (
+         SELECT 1
+           FROM dependencies d
+           JOIN issues b ON d.blocker_id = b.id
+          WHERE d.blocked_id = i.id AND b.status = 'open')
+   AND NOT EXISTS (
+         SELECT 1
+           FROM issues s
+          WHERE s.parent_id = i.id AND s.status = 'open')
+ ORDER BY CASE i.priority
+            WHEN 'critical' THEN 0
+            WHEN 'high'     THEN 1
+            WHEN 'medium'   THEN 2
+            WHEN 'low'      THEN 3
+            ELSE 4
+          END, i.id;
+```
+
+**Blocked issues with their open blockers**
+
+```sql
+SELECT i.id AS blocked, i.title, b.id AS blocker, b.title AS blocker_title
+  FROM issues i
+  JOIN dependencies d ON d.blocked_id = i.id
+  JOIN issues b ON d.blocker_id = b.id
+ WHERE i.status = 'open' AND b.status = 'open'
+ ORDER BY i.id;
+```
+
+**Open issues that still have open subissues**
+
+```sql
+SELECT p.id, p.title, COUNT(s.id) AS open_subissues
+  FROM issues p
+  JOIN issues s ON s.parent_id = p.id
+ WHERE p.status = 'open' AND s.status = 'open'
+ GROUP BY p.id, p.title
+ ORDER BY p.id;
+```
+
+**Currently held locks — which worker is on what**
+
+```sql
+SELECT l.issue_id, l.agent_id, l.branch, l.claimed_at, i.title
+  FROM locks l
+  JOIN issues i ON i.id = l.issue_id
+ ORDER BY l.claimed_at;
+```
+
+**Recent comments on a given issue**
+
+```sql
+SELECT id, kind, created_at, left(content, 80) AS preview
+  FROM comments
+ WHERE issue_id = 42
+ ORDER BY created_at DESC;
+```
+
+**Counts by status and priority** — quick gut check on the backlog shape:
+
+```sql
+SELECT status, priority, count(*)
+  FROM issues
+ GROUP BY status, priority
+ ORDER BY status, priority;
+```
+
+Notes on the other tables: `agent_config` is a single-row table holding the project-wide agent id and description. `locks` rows are released when an issue is completed; the `stale_lock_timeout_minutes` value in `.bogstandard/config.json` is the cutoff after which another worker may steal an apparently abandoned lock.
+
 ## Running the tests
 
 ```bash
