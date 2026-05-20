@@ -1,6 +1,9 @@
 # BogStandard
 
-BogStandard automates a two-phase plan→implement loop for issues tracked in a managed Postgres database. It runs as a [pi](https://github.com/earendil-works/pi) extension: a single `/bogstandard` command drives the full flow — issue review, planning, optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
+BogStandard automates a two-phase plan→implement loop for issues tracked in a managed Postgres database. It runs as a [pi](https://github.com/earendil-works/pi) extension exposing two commands:
+
+- `/bs-task` drives the full plan→implement flow — issue review, planning, optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
+- `/bs-design` opens a separate conversational Designer session for brainstorming and creating new issues (create, update, comment, block, subissue, reparent, archive). The Designer never closes issues; closing belongs to `/bs-task`.
 
 ## One-time setup
 
@@ -42,21 +45,26 @@ Copies issues, comments, dependencies, and the `agent.json` agent id into the ne
 
 ## Running the workflow
 
-Load the extension with `-e` and invoke the `/bogstandard` command:
+Load the extension with `-e` and invoke either command:
 
 ```bash
-# Auto-pick the next eligible open issue
-pi -e ./agent/extensions/bogstandard /bogstandard
+# Brainstorm and create new issues
+pi -e ./agent/extensions/bogstandard /bs-design
+
+# Auto-pick the next eligible open issue and work it end-to-end
+pi -e ./agent/extensions/bogstandard /bs-task
 
 # Explicit issue number
-pi -e ./agent/extensions/bogstandard /bogstandard 42
+pi -e ./agent/extensions/bogstandard /bs-task 42
 ```
 
-**Auto-pick** selects the first open issue with no open subissues and no open blockers, sorted by priority (critical → high → medium → low) then by id. The issue review screen lets you continue, add a comment, switch to a different issue, or abort.
+**`/bs-design`** runs a conversational Designer agent with a tool surface limited to issue CRUD: `list_issues`, `show_issue`, `create_issue`, `create_subissue`, `update_issue`, `add_comment`, `block`, `unblock`, `reparent`, `archive`. It is stateless across pi sessions — re-run any time to continue brainstorming. The Designer does not modify source files, run git, or close issues.
 
-**Explicit issue** skips the auto-pick and goes straight to review for that issue.
+**`/bs-task` auto-pick** selects the first open issue with no open subissues and no open blockers, sorted by priority (critical → high → medium → low) then by id. The issue review screen lets you continue, add a comment, switch to a different issue, or abort.
 
-Both paths end with closing the issue (`UPDATE issues SET status='closed'`) and creating a git commit. Closing an issue no longer touches CHANGELOG.md — only the git commit message reflects the change.
+**`/bs-task` with an explicit issue id** skips the auto-pick and goes straight to review for that issue.
+
+Both `/bs-task` paths end with closing the issue (`UPDATE issues SET status='closed'`) and creating a git commit. Closing an issue no longer touches CHANGELOG.md — only the git commit message reflects the change.
 
 ### Planning and plan review
 
@@ -87,7 +95,7 @@ pi -e ./agent/extensions/bogstandard \
    --bs-impl-model     anthropic/claude-opus-4-7 \
    --bs-red-plan-model openrouter/deepseek/deepseek-v4-flash \
    --bs-green-impl-model anthropic/claude-opus-4-7 \
-   /bogstandard
+   /bs-task
 ```
 
 Flag format: `provider/model-id`, e.g. `openrouter/deepseek/deepseek-v4-flash` or `anthropic/claude-sonnet-4-6`. The broad flags (`--bs-plan-model`, `--bs-impl-model`) apply to all planning or implementation phases; the per-sub-phase flags override them when set.
@@ -162,13 +170,15 @@ scripts/
 agent/
   extensions/
     bogstandard/               # The pi extension (TypeScript)
-      index.ts                   # Extension factory: command, tools, event handlers
+      index.ts                   # Extension factory: /bs-task command, event handlers
+      designer.ts                # /bs-design command + Designer tools (create/update/block/etc.)
+      designer-prompts.ts        # Designer system prompt + kickoff message
       config.ts                  # Flag/env/file config resolution
-      db.ts                      # Postgres adapter (replaces the old chainlink wrappers)
+      db.ts                      # Postgres adapter (issue CRUD, locks, dependencies)
       git.ts                     # Typed wrappers over pi.exec("git", ...)
       issue-picker.ts            # Eligibility query (single SQL) + label formatting
-      phases.ts                  # Phase state types, loadState / saveState
-      prompts.ts                 # All six prompt builders (inline content, no temp files)
+      phases.ts                  # /bs-task phase state types, loadState / saveState
+      prompts.ts                 # All six /bs-task prompt builders (inline content, no temp files)
       questionnaire.ts           # Questionnaire tool for plan-phase clarifying questions
       scrollable-markdown.ts     # ScrollableMarkdownView component used by issue + plan review
       scroll-math.ts             # Pure scroll-offset helpers (testable without pi runtime)
@@ -183,6 +193,7 @@ tests/
   db.test.ts                     # Unit tests for buildIssueDisplay + isLockStale
   config.test.ts                 # Unit tests for config precedence
   scroll-math.test.ts            # Unit tests for scroll-offset helpers
+  designer.test.ts               # Unit tests for assertPriority + Designer prompt builders
 package.json                   # vitest + pg + better-sqlite3 + tsx
 dispatch.sh                    # Multi-worker dispatcher (postgres-backed)
 vitest.config.ts

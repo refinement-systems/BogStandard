@@ -1,13 +1,9 @@
 /**
  * BogStandard — plan & implement issues end-to-end from pi.
  *
- * Replaces the bash `bogstandard` and `bogstandard-implement-issue`
- * orchestrators. Per-phase model selection and the TS test harness still
- * follow in later phases of the refactor (see PLAN).
- *
  * Two paths share one command and one state machine:
  *
- *   /bogstandard [issue]
+ *   /bs-task [issue]
  *     -> pick issue + review-and-comment loop
  *     -> "Does this issue need tests?"
  *          -> no  : no-tests path
@@ -24,8 +20,12 @@
  * Planning phases emit their plan via the `save_plan` tool (terminate: true).
  * Green-phase implementation can call `bail_out` to abort the cycle.
  *
- * Phase state is persisted via `pi.appendEntry("bogstandard-phase", ...)` so
+ * Phase state is persisted via `pi.appendEntry("bs-task-phase", ...)` so
  * `pi -r` resumes from where we left off.
+ *
+ * The Designer stage (`/bs-design`) lives in `./designer.ts`; it runs as a
+ * separate, conversational command and does not participate in this state
+ * machine.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -62,6 +62,7 @@ import {
 	buildRedPlanPrompt,
 } from "./prompts.js";
 import { registerQuestionnaireTool } from "./questionnaire.js";
+import { registerDesigner } from "./designer.js";
 import { showScrollableMarkdown } from "./scrollable-markdown.js";
 
 const PLAN_TOOLS = ["read", "grep", "find", "ls", "bash", "questionnaire", "save_plan"];
@@ -99,6 +100,10 @@ export default function bogstandard(pi: ExtensionAPI) {
 
 	registerQuestionnaireTool(pi);
 
+	registerDesigner(pi, {
+		isTaskActive: () => state.phase !== "idle" && state.phase !== "done",
+	});
+
 	// Per-phase model selection flags. The broad ones apply to every planner
 	// or implementer phase; the per-sub-phase overrides take precedence when
 	// set. All values take pi's standard `provider/id` form, e.g.
@@ -129,7 +134,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 	});
 	pi.registerFlag("bs-issue-id", {
 		description:
-			"Issue ID to work on (set by dispatch.sh to pre-assign workers; skips auto-pick). For interactive use, type '/bogstandard <id>' in the prompt instead.",
+			"Issue ID to work on (set by dispatch.sh to pre-assign workers; skips auto-pick). For interactive use, type '/bs-task <id>' in the prompt instead.",
 		type: "string",
 	});
 	pi.registerFlag("bs-database-url", {
@@ -215,7 +220,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		return undefined;
 	});
 
-	pi.registerCommand("bogstandard", {
+	pi.registerCommand("bs-task", {
 		description: "Plan & implement the next eligible issue (or the one whose id you pass)",
 		getArgumentCompletions: async (prefix) => {
 			try {
@@ -241,7 +246,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 					return;
 				}
 				ctx.ui.notify(
-					`bogstandard is already running (phase: ${state.phase}). Resolve or /new to start over.`,
+					`/bs-task is already running (phase: ${state.phase}). Resolve or /new to start over.`,
 					"warning",
 				);
 				return;
@@ -354,7 +359,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 					if (!clean) {
 						await locksRelease(pi, issue.id);
 						ctx.ui.notify(
-							"TDD path requires a clean working tree. Stash or commit your changes, then re-run /bogstandard.",
+							"TDD path requires a clean working tree. Stash or commit your changes, then re-run /bs-task.",
 							"error",
 						);
 						return;
@@ -369,7 +374,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				await kickoffPhase(
 					ctx,
 					"planning-red",
-					"bogstandard-red-plan-prompt",
+					"bs-task-red-plan-prompt",
 					buildRedPlanPrompt(issue),
 					PLAN_TOOLS,
 				);
@@ -382,7 +387,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 			await kickoffPhase(
 				ctx,
 				"planning",
-				"bogstandard-plan-prompt",
+				"bs-task-plan-prompt",
 				buildPlanPrompt(issue),
 				PLAN_TOOLS,
 			);
@@ -445,7 +450,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 			return "abort";
 		}
 		if (decision === "pick-other") {
-			ctx.ui.notify("Re-run /bogstandard to pick a different issue.", "info");
+			ctx.ui.notify("Re-run /bs-task to pick a different issue.", "info");
 			return "abort";
 		}
 		// Steal
@@ -556,8 +561,8 @@ export default function bogstandard(pi: ExtensionAPI) {
 			}
 		} catch (err) {
 			// Surface unexpected failures rather than silently leaving the state
-			// machine stuck; user can then re-invoke /bogstandard or pi -r.
-			ctx.ui.notify(`bogstandard: ${err}`, "error");
+			// machine stuck; user can then re-invoke /bs-task or pi -r.
+			ctx.ui.notify(`/bs-task: ${err}`, "error");
 		}
 	});
 
@@ -676,7 +681,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 
 		const slash = spec.indexOf("/");
 		if (slash < 0) {
-			ctx.ui.notify(`Invalid bogstandard model spec '${spec}' — expected provider/id.`, "error");
+			ctx.ui.notify(`Invalid /bs-task model spec '${spec}' — expected provider/id.`, "error");
 			return;
 		}
 		const provider = spec.slice(0, slash);
@@ -684,13 +689,13 @@ export default function bogstandard(pi: ExtensionAPI) {
 
 		const model = ctx.modelRegistry.find(provider, id);
 		if (!model) {
-			ctx.ui.notify(`bogstandard: model not found: ${spec}`, "error");
+			ctx.ui.notify(`/bs-task: model not found: ${spec}`, "error");
 			return;
 		}
 
 		const ok = await pi.setModel(model);
 		if (!ok) {
-			ctx.ui.notify(`bogstandard: no API key configured for ${spec}`, "error");
+			ctx.ui.notify(`/bs-task: no API key configured for ${spec}`, "error");
 		}
 	}
 
@@ -712,13 +717,13 @@ export default function bogstandard(pi: ExtensionAPI) {
 
 	function customTypeForPhase(phase: Phase): string {
 		switch (phase) {
-			case "planning":           return "bogstandard-plan-prompt";
-			case "planning-red":       return "bogstandard-red-plan-prompt";
-			case "planning-green":     return "bogstandard-green-plan-prompt";
-			case "implementing":       return "bogstandard-impl-prompt";
-			case "implementing-red":   return "bogstandard-red-impl-prompt";
-			case "implementing-green": return "bogstandard-green-impl-prompt";
-			default:                   return "bogstandard-prompt";
+			case "planning":           return "bs-task-plan-prompt";
+			case "planning-red":       return "bs-task-red-plan-prompt";
+			case "planning-green":     return "bs-task-green-plan-prompt";
+			case "implementing":       return "bs-task-impl-prompt";
+			case "implementing-red":   return "bs-task-red-impl-prompt";
+			case "implementing-green": return "bs-task-green-impl-prompt";
+			default:                   return "bs-task-prompt";
 		}
 	}
 
@@ -736,11 +741,11 @@ export default function bogstandard(pi: ExtensionAPI) {
 		if (pi.getFlag("bs-debug")) {
 			const systemPrompt = buildPhaseSystemPrompt(phase, "");
 			pi.sendMessage(
-				{ content: `**[bogstandard-debug] ${phase} — system prompt**\n\n${systemPrompt}`, display: true },
+				{ content: `**[bs-task-debug] ${phase} — system prompt**\n\n${systemPrompt}`, display: true },
 				{ triggerTurn: false },
 			);
 			pi.sendMessage(
-				{ content: `**[bogstandard-debug] ${phase} — user prompt**\n\n${content}`, display: true },
+				{ content: `**[bs-task-debug] ${phase} — user prompt**\n\n${content}`, display: true },
 				{ triggerTurn: false },
 			);
 		}
@@ -778,7 +783,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 			}
 			await postDurableComment(ctx, "decision", "interrupt-resolved", { choice: "continue" });
 			if (!state.lastPrompt) {
-				ctx.ui.notify("No saved prompt to resume from. Re-run /bogstandard.", "error");
+				ctx.ui.notify("No saved prompt to resume from. Re-run /bs-task.", "error");
 				return;
 			}
 			const tools = activeToolsForPhase(phase)!;
@@ -901,7 +906,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				await kickoffPhase(
 					ctx,
 					"implementing",
-					"bogstandard-impl-prompt",
+					"bs-task-impl-prompt",
 					buildImplementPrompt(issue, plan),
 					IMPL_TOOLS,
 				);
@@ -922,7 +927,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				await kickoffPhase(
 					ctx,
 					"implementing-red",
-					"bogstandard-red-impl-prompt",
+					"bs-task-red-impl-prompt",
 					buildRedImplementPrompt(issue, plan),
 					IMPL_TOOLS,
 				);
@@ -943,7 +948,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		const hasChanges = await hasStagedChanges(pi);
 		if (!hasChanges) {
 			ctx.ui.notify(
-				"Red phase produced no changes. The implementer was supposed to write failing tests. Use /bogstandard to retry or pi -r to resume.",
+				"Red phase produced no changes. The implementer was supposed to write failing tests. Use /bs-task to retry or pi -r to resume.",
 				"error",
 			);
 			// Leave phase at implementing-red so resume picks up.
@@ -981,7 +986,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		await kickoffPhase(
 			ctx,
 			"planning-green",
-			"bogstandard-green-plan-prompt",
+			"bs-task-green-plan-prompt",
 			buildGreenPlanPrompt(issue, diff),
 			PLAN_TOOLS,
 		);
@@ -1000,7 +1005,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				await kickoffPhase(
 					ctx,
 					"implementing-green",
-					"bogstandard-green-impl-prompt",
+					"bs-task-green-impl-prompt",
 					buildGreenImplementPrompt(issue, plan, state.redDiff),
 					GREEN_IMPL_TOOLS,
 				);
@@ -1059,7 +1064,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		await kickoffPhase(
 			ctx,
 			"planning-red",
-			"bogstandard-red-plan-prompt",
+			"bs-task-red-plan-prompt",
 			buildRedPlanPrompt(issue),
 			PLAN_TOOLS,
 		);
@@ -1108,7 +1113,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		while (issue) {
 			pi.sendMessage(
 				{
-					customType: "bogstandard-issue",
+					customType: "bs-task-issue",
 					content: `## ${formatIssueLabel(issue)}\n\n${buildIssueDisplay(issue)}`,
 					display: true,
 				},
@@ -1170,7 +1175,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				return;
 			}
 			default:
-				ctx.ui.notify(`Recovered to phase '${phase}' — re-run /bogstandard to continue.`, "warning");
+				ctx.ui.notify(`Recovered to phase '${phase}' — re-run /bs-task to continue.`, "warning");
 		}
 	}
 
@@ -1185,7 +1190,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 			);
 		} catch (err) {
 			ctx.ui.notify(
-				`bogstandard: postgres configuration not loaded — ${err instanceof Error ? err.message : String(err)}. Run 'npm run setup' to create .bogstandard/config.json.`,
+				`/bs-task: postgres configuration not loaded — ${err instanceof Error ? err.message : String(err)}. Run 'npm run setup' to create .bogstandard/config.json.`,
 				"error",
 			);
 			return;
@@ -1196,7 +1201,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				issue = await issueShowJson(pi, state.issueId);
 			} catch {
 				ctx.ui.notify(
-					`Could not refetch issue #${state.issueId}; resetting bogstandard state.`,
+					`Could not refetch issue #${state.issueId}; resetting /bs-task state.`,
 					"warning",
 				);
 				reset();

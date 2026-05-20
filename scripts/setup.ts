@@ -175,7 +175,8 @@ async function main(): Promise<void> {
 	writeConfig(projectRoot, { databaseUrl, agentId: args.agentId, staleLockTimeoutMinutes: args.staleLockTimeoutMinutes }, args.force);
 
 	console.log(`\nDone. Run pi from ${projectRoot} with:`);
-	console.log(`  pi -e ${bogstandardHome}/agent/extensions/bogstandard /bogstandard`);
+	console.log(`  pi -e ${bogstandardHome}/agent/extensions/bogstandard /bs-design   # brainstorm + create issues`);
+	console.log(`  pi -e ${bogstandardHome}/agent/extensions/bogstandard /bs-task     # plan + implement next eligible issue`);
 }
 
 function reportError(err: unknown): void {

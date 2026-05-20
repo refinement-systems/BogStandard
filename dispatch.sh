@@ -154,7 +154,7 @@ EOF
     if [[ ${#PI_ARGS[@]} -gt 0 ]]; then
         CMD="${CMD} ${PI_ARGS[*]}"
     fi
-    CMD="${CMD} /bogstandard"
+    CMD="${CMD} /bs-task"
 
     if [[ "$first" -eq 1 ]]; then
         tmux rename-window -t "${SESSION}:0" "$WIN_NAME"

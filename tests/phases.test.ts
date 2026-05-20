@@ -8,7 +8,7 @@ function makeCtx(entries: unknown[]) {
 }
 
 function makeEntry(data: BogstandardPhaseEntry) {
-	return { type: "custom", customType: "bogstandard-phase", data };
+	return { type: "custom", customType: "bs-task-phase", data };
 }
 
 describe("loadState", () => {
@@ -16,12 +16,12 @@ describe("loadState", () => {
 		expect(loadState(makeCtx([]) as any)).toEqual({ phase: "idle" });
 	});
 
-	it("returns the single bogstandard-phase entry", () => {
+	it("returns the single bs-task-phase entry", () => {
 		const ctx = makeCtx([makeEntry({ phase: "planning", issueId: 42 })]);
 		expect(loadState(ctx as any)).toEqual({ phase: "planning", issueId: 42 });
 	});
 
-	it("returns the LAST of multiple bogstandard-phase entries", () => {
+	it("returns the LAST of multiple bs-task-phase entries", () => {
 		const ctx = makeCtx([
 			makeEntry({ phase: "planning", issueId: 42 }),
 			makeEntry({ phase: "reviewing-plan", issueId: 42, plan: "my plan" }),
@@ -40,13 +40,13 @@ describe("loadState", () => {
 	});
 
 	it("ignores entries with null data", () => {
-		const ctx = makeCtx([{ type: "custom", customType: "bogstandard-phase", data: null }]);
+		const ctx = makeCtx([{ type: "custom", customType: "bs-task-phase", data: null }]);
 		expect(loadState(ctx as any)).toEqual({ phase: "idle" });
 	});
 
 	it("ignores entries where data.phase is not a string", () => {
 		const ctx = makeCtx([
-			{ type: "custom", customType: "bogstandard-phase", data: { phase: 99 } },
+			{ type: "custom", customType: "bs-task-phase", data: { phase: 99 } },
 		]);
 		expect(loadState(ctx as any)).toEqual({ phase: "idle" });
 	});
@@ -79,11 +79,11 @@ describe("saveState", () => {
 		};
 	}
 
-	it("calls appendEntry with 'bogstandard-phase' type", () => {
+	it("calls appendEntry with 'bs-task-phase' type", () => {
 		const { pi, calls } = capturePi();
 		saveState(pi as any, { phase: "planning", issueId: 1 });
 		expect(calls).toHaveLength(1);
-		expect(calls[0].type).toBe("bogstandard-phase");
+		expect(calls[0].type).toBe("bs-task-phase");
 	});
 
 	it("persists phase and issueId", () => {

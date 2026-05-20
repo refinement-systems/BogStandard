@@ -6,7 +6,9 @@ The swamp level of agent orchestrators.
 
 BogStandard is a pi extension and an orchestrator script.
 
-* The extension automates a two-phase `plan → implement` loop for issues stored in a managed Postgres database. It runs as a [pi](https://github.com/earendil-works/pi) extension: a single `/bogstandard` command drives issue review, planning (with interactive refinement), optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
+* The extension automates a two-phase `plan → implement` loop for issues stored in a managed Postgres database. It runs as a [pi](https://github.com/earendil-works/pi) extension exposing two commands:
+  * `/bs-task` drives issue review, planning (with interactive refinement), optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
+  * `/bs-design` opens a conversational Designer session for brainstorming and seeding new issues into the database (create, update, block, subissue, archive — but not close, since that belongs to `/bs-task`).
 * The script runs multiple sessions in parallel, picking the appropriate issues.
 
 NOTE: while the extension is okay-ish, the dispatch.sh is very WIP and should not be used for any valuable projects.
@@ -65,18 +67,25 @@ The extension and scripts read `.bogstandard/config.json` for the postgres conne
 Run from inside a project that has been set up:
 
 ```bash
+# Brainstorm and create new issues with the Designer
+pi -e /path/to/BogStandard/agent/extensions/bogstandard /bs-design
+
 # Auto-pick the next eligible open issue
-pi -e /path/to/BogStandard/agent/extensions/bogstandard /bogstandard
+pi -e /path/to/BogStandard/agent/extensions/bogstandard /bs-task
 
 # Explicit issue number
-pi -e /path/to/BogStandard/agent/extensions/bogstandard /bogstandard 42
+pi -e /path/to/BogStandard/agent/extensions/bogstandard /bs-task 42
 ```
 
 If you're running from the repo root, use a relative path:
 
 ```bash
-pi -e ./agent/extensions/bogstandard /bogstandard
+pi -e ./agent/extensions/bogstandard /bs-task
 ```
+
+### Designer (`/bs-design`)
+
+`/bs-design` opens a conversational session for filling the backlog. The agent has read-only access to the codebase plus a tool set scoped to issue creation and refinement: `list_issues`, `show_issue`, `create_issue`, `create_subissue`, `update_issue`, `add_comment`, `block`, `unblock`, `reparent`, and `archive`. Closing and reopening are intentionally absent — those belong to `/bs-task`. The Designer is stateless across sessions; re-run `/bs-design` any time to keep brainstorming.
 
 ### Issue selection
 
@@ -109,7 +118,7 @@ pi -e ./agent/extensions/bogstandard \
    --bs-impl-model       openrouter/deepseek/deepseek-v4-flash \
    --bs-red-plan-model   openrouter/deepseek/deepseek-v4-pro \
    --bs-green-impl-model openrouter/deepseek/deepseek-v4-flash \
-   /bogstandard
+   /bs-task
 ```
 
 | Flag | Applies to |

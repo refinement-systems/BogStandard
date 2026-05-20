@@ -1,7 +1,7 @@
 /**
- * Phase state for the bogstandard orchestrator.
+ * Phase state for the /bs-task orchestrator.
  *
- * Persisted via `pi.appendEntry("bogstandard-phase", BogstandardPhaseEntry)`.
+ * Persisted via `pi.appendEntry("bs-task-phase", BogstandardPhaseEntry)`.
  * On `session_start` the extension walks back through entries to find the
  * latest entry of this customType and rehydrates `BogstandardState`.
  *
@@ -44,7 +44,7 @@ export interface BogstandardState {
 }
 
 /**
- * Serialized blob written to `pi.appendEntry("bogstandard-phase", ...)`.
+ * Serialized blob written to `pi.appendEntry("bs-task-phase", ...)`.
  * Keep this shape stable across versions; future versions can grow optional
  * fields but should not remove or repurpose existing ones.
  */
@@ -57,7 +57,7 @@ export interface BogstandardPhaseEntry {
 	lastPrompt?: string;
 }
 
-const ENTRY_TYPE = "bogstandard-phase";
+const ENTRY_TYPE = "bs-task-phase";
 
 interface CustomEntry extends SessionEntry {
 	type: "custom";
@@ -108,21 +108,21 @@ export function saveState(pi: ExtensionAPI, state: BogstandardState): void {
 }
 
 /**
- * Build the machine-parseable HTML comment header for a durable BogStandard event.
- * Format: `<!-- bogstandard:v=1 event=<slug> [k=v ...] -->`
+ * Build the machine-parseable HTML comment header for a durable /bs-task event.
+ * Format: `<!-- bs-task:v=1 event=<slug> [k=v ...] -->`
  */
 export function buildBsHeader(event: string, attrs: Record<string, string> = {}): string {
 	const pairs = [`event=${event}`, ...Object.entries(attrs).map(([k, v]) => `${k}=${v}`)].join(" ");
-	return `<!-- bogstandard:v=1 ${pairs} -->`;
+	return `<!-- bs-task:v=1 ${pairs} -->`;
 }
 
 /**
- * Parse the first line of a comment body as a BogStandard event header.
+ * Parse the first line of a comment body as a /bs-task event header.
  * Returns a map of all key=value pairs (including `event`) or null if the line
- * is not a BogStandard header.
+ * is not a /bs-task header.
  */
 export function parseBsHeader(line: string): Record<string, string> | null {
-	const match = line.match(/^<!-- bogstandard:v=\d+ (.+?)-->$/);
+	const match = line.match(/^<!-- bs-task:v=\d+ (.+?)-->$/);
 	if (!match) return null;
 	const attrs: Record<string, string> = {};
 	for (const token of match[1].trim().split(/\s+/)) {

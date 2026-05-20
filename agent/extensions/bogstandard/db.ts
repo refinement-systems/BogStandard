@@ -213,6 +213,201 @@ export async function issueClose(
 	}
 }
 
+// ── Designer writes ─────────────────────────────────────────────────────────
+
+export type Priority = "low" | "medium" | "high" | "critical";
+
+const PRIORITIES: readonly Priority[] = ["low", "medium", "high", "critical"];
+
+export function assertPriority(p: string): asserts p is Priority {
+	if (!(PRIORITIES as readonly string[]).includes(p)) {
+		throw new Error(
+			`Invalid priority '${p}'. Must be one of: ${PRIORITIES.join(", ")}`,
+		);
+	}
+}
+
+export interface IssueCreateInput {
+	title: string;
+	description?: string;
+	priority: string;
+	parent_id?: number;
+}
+
+/** Insert a new open issue. Returns the new id. */
+export async function issueCreate(
+	_pi: ExtensionAPI,
+	input: IssueCreateInput,
+): Promise<number> {
+	assertPriority(input.priority);
+	if (!input.title.trim()) {
+		throw new Error("Issue title must not be empty");
+	}
+	const res = await getPool().query<{ id: string }>(
+		`INSERT INTO issues (title, description, priority, parent_id)
+		      VALUES ($1, $2, $3, $4)
+		   RETURNING id`,
+		[input.title, input.description ?? null, input.priority, input.parent_id ?? null],
+	);
+	return Number(res.rows[0].id);
+}
+
+export interface IssueUpdateInput {
+	title?: string;
+	description?: string;
+	priority?: string;
+}
+
+/** Partial UPDATE; no-op if every field is undefined. */
+export async function issueUpdate(
+	_pi: ExtensionAPI,
+	id: number,
+	input: IssueUpdateInput,
+): Promise<void> {
+	const sets: string[] = [];
+	const params: unknown[] = [];
+	if (input.title !== undefined) {
+		if (!input.title.trim()) throw new Error("Issue title must not be empty");
+		params.push(input.title);
+		sets.push(`title = $${params.length}`);
+	}
+	if (input.description !== undefined) {
+		params.push(input.description);
+		sets.push(`description = $${params.length}`);
+	}
+	if (input.priority !== undefined) {
+		assertPriority(input.priority);
+		params.push(input.priority);
+		sets.push(`priority = $${params.length}`);
+	}
+	if (sets.length === 0) return;
+	params.push(id);
+	const result = await getPool().query(
+		`UPDATE issues SET ${sets.join(", ")}, updated_at = now() WHERE id = $${params.length}`,
+		params,
+	);
+	if (result.rowCount === 0) throw new Error(`Issue ${id} not found`);
+}
+
+/** Set or clear an issue's parent_id. Null promotes a subissue to top-level. */
+export async function issueSetParent(
+	_pi: ExtensionAPI,
+	id: number,
+	parentId: number | null,
+): Promise<void> {
+	if (parentId !== null && parentId === id) {
+		throw new Error("An issue cannot be its own parent");
+	}
+	const result = await getPool().query(
+		`UPDATE issues SET parent_id = $1, updated_at = now() WHERE id = $2`,
+		[parentId, id],
+	);
+	if (result.rowCount === 0) throw new Error(`Issue ${id} not found`);
+}
+
+/** Soft-delete: mark the issue as archived. */
+export async function issueArchive(
+	_pi: ExtensionAPI,
+	id: number,
+): Promise<void> {
+	const result = await getPool().query(
+		`UPDATE issues SET status = 'archived', updated_at = now() WHERE id = $1`,
+		[id],
+	);
+	if (result.rowCount === 0) throw new Error(`Issue ${id} not found`);
+}
+
+export async function dependencyAdd(
+	_pi: ExtensionAPI,
+	blockedId: number,
+	blockerId: number,
+): Promise<void> {
+	if (blockedId === blockerId) {
+		throw new Error("An issue cannot block itself");
+	}
+	try {
+		await getPool().query(
+			`INSERT INTO dependencies (blocker_id, blocked_id) VALUES ($1, $2)`,
+			[blockerId, blockedId],
+		);
+	} catch (err) {
+		const code = (err as { code?: string }).code;
+		if (code === "23505") {
+			throw new Error(`Issue ${blockedId} is already blocked by issue ${blockerId}`);
+		}
+		if (code === "23503") {
+			throw new Error(`Either issue ${blockedId} or ${blockerId} does not exist`);
+		}
+		throw err;
+	}
+}
+
+export async function dependencyRemove(
+	_pi: ExtensionAPI,
+	blockedId: number,
+	blockerId: number,
+): Promise<void> {
+	const result = await getPool().query(
+		`DELETE FROM dependencies WHERE blocker_id = $1 AND blocked_id = $2`,
+		[blockerId, blockedId],
+	);
+	if (result.rowCount === 0) {
+		throw new Error(`No block relationship from ${blockerId} to ${blockedId}`);
+	}
+}
+
+export interface IssueListFilter {
+	status?: string;
+	priority?: string;
+	parent_id?: number | null;
+}
+
+/** List issues with optional filters. Used by the Designer's `list_issues` tool. */
+export async function issueListFiltered(
+	_pi: ExtensionAPI,
+	filter: IssueListFilter = {},
+): Promise<Array<IssueListEntry & { parent_id: number | null }>> {
+	const clauses: string[] = [];
+	const params: unknown[] = [];
+	if (filter.status !== undefined) {
+		params.push(filter.status);
+		clauses.push(`status = $${params.length}`);
+	}
+	if (filter.priority !== undefined) {
+		params.push(filter.priority);
+		clauses.push(`priority = $${params.length}`);
+	}
+	if (filter.parent_id !== undefined) {
+		if (filter.parent_id === null) {
+			clauses.push(`parent_id IS NULL`);
+		} else {
+			params.push(filter.parent_id);
+			clauses.push(`parent_id = $${params.length}`);
+		}
+	}
+	const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+	const res = await getPool().query<{
+		id: string;
+		title: string;
+		status: string;
+		priority: string;
+		parent_id: string | null;
+	}>(
+		`SELECT id, title, status, priority, parent_id
+		   FROM issues
+		   ${where}
+		   ORDER BY id`,
+		params,
+	);
+	return res.rows.map((r) => ({
+		id: Number(r.id),
+		title: r.title,
+		status: r.status,
+		priority: r.priority,
+		parent_id: r.parent_id === null ? null : Number(r.parent_id),
+	}));
+}
+
 // ── Locks ────────────────────────────────────────────────────────────────────
 
 export interface LockEntry {
