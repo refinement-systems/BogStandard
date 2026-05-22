@@ -891,8 +891,8 @@ export default function bogstandard(pi: ExtensionAPI) {
 			ctx.ui.notify(`Failed to commit incomplete work: ${err}`, "warning");
 		}
 
-		reset();
 		ctx.ui.notify(`Issue #${issue.id} left open. Incomplete work committed.`, "info");
+		reset();
 	}
 
 	// === No-tests path ===
