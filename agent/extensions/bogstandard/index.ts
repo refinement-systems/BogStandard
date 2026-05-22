@@ -1075,6 +1075,59 @@ export default function bogstandard(pi: ExtensionAPI) {
 	// === Shared close + commit ===
 
 	async function closeAndCommit(ctx: ExtensionContext, currentIssue: IssueDetail): Promise<void> {
+		// Check for changes before closing so we can offer an escape hatch if the
+		// implementation made no file modifications (e.g. a verification-only issue).
+		let clean = false;
+		try {
+			clean = await isClean(pi);
+		} catch {
+			// if the check fails, proceed normally and let git commit surface the error
+		}
+
+		if (clean) {
+			while (true) {
+				const choice = await ctx.ui.select(
+					"No file changes detected — what would you like to do?",
+					[
+						"Close issue without committing",
+						"Add a comment",
+						"Abort (leave issue open)",
+					],
+				);
+				if (!choice || choice.startsWith("Abort")) {
+					await locksRelease(pi, currentIssue.id);
+					ctx.ui.notify("Aborted. Issue left open.", "info");
+					return;
+				}
+				if (choice.startsWith("Add a comment")) {
+					const body = await ctx.ui.editor("Comment:", "");
+					if (body !== undefined && body.trim() !== "") {
+						try {
+							await issueComment(pi, currentIssue.id, "human", body);
+						} catch (err) {
+							ctx.ui.notify(`Failed to post comment: ${err}`, "error");
+						}
+					}
+					continue;
+				}
+				break; // "Close issue without committing"
+			}
+
+			try {
+				await issueClose(pi, currentIssue.id);
+			} catch (err) {
+				ctx.ui.notify(`Failed to close issue: ${err}`, "error");
+				return;
+			}
+			await locksRelease(pi, currentIssue.id);
+			await postDurableComment(ctx, "resolution", "closed", {}, `Issue #${currentIssue.id} closed.`);
+			ctx.ui.notify(`Issue #${currentIssue.id} closed (no files changed).`, "info");
+			state = { phase: "done", issueId: currentIssue.id };
+			issue = undefined;
+			persist();
+			return;
+		}
+
 		try {
 			await issueClose(pi, currentIssue.id);
 		} catch (err) {
