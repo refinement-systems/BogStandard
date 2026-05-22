@@ -41,6 +41,12 @@ export interface BogstandardState {
 	bailReason?: string;
 	/** The prompt last sent to kickoffPhase; replayed when "Continue" is chosen after an interrupt. */
 	lastPrompt?: string;
+	/**
+	 * Short SHA of the red commit, set by reconstructState when recovering after a green-bail.
+	 * routeRecoveredState uses this to reset git to before the red commit before restarting the
+	 * red planner, cleaning up any commits written during the aborted TDD cycle.
+	 */
+	bailRedSha?: string;
 }
 
 /**
@@ -55,6 +61,7 @@ export interface BogstandardPhaseEntry {
 	redDiff?: string;
 	bailReason?: string;
 	lastPrompt?: string;
+	bailRedSha?: string;
 }
 
 const ENTRY_TYPE = "bs-task-phase";
@@ -88,6 +95,7 @@ export function loadState(ctx: ExtensionContext): BogstandardState {
 					redDiff: data.redDiff,
 					bailReason: data.bailReason,
 					lastPrompt: data.lastPrompt,
+					bailRedSha: data.bailRedSha,
 				};
 			}
 		}
@@ -103,6 +111,7 @@ export function saveState(pi: ExtensionAPI, state: BogstandardState): void {
 		redDiff: state.redDiff,
 		bailReason: state.bailReason,
 		lastPrompt: state.lastPrompt,
+		bailRedSha: state.bailRedSha,
 	};
 	pi.appendEntry(ENTRY_TYPE, entry);
 }
@@ -208,7 +217,10 @@ export async function reconstructState(
 		return { phase: "done", issueId: issue.id };
 	}
 	if (hasGreenBail) {
-		return { phase: "planning-red", issueId: issue.id };
+		// Include the red commit SHA so routeRecoveredState can reset git to before it,
+		// cleaning up the red commit and any subsequent commits (e.g. WIP commit from
+		// "Not done, quitting") before restarting the red planner.
+		return { phase: "planning-red", issueId: issue.id, bailRedSha: lastRedCommit?.attrs["sha"] };
 	}
 	if (lastGreenPlan) {
 		const redDiff = await getRedDiff(lastRedCommit?.attrs["sha"]);

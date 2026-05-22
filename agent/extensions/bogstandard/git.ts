@@ -65,6 +65,10 @@ export async function resetHardHeadMinus1(pi: ExtensionAPI, signal?: AbortSignal
 	await run(pi, ["reset", "--hard", "HEAD~1"], { signal });
 }
 
+export async function resetHardToRef(pi: ExtensionAPI, ref: string, signal?: AbortSignal): Promise<void> {
+	await run(pi, ["reset", "--hard", ref], { signal });
+}
+
 export async function headShortSha(pi: ExtensionAPI, signal?: AbortSignal): Promise<string> {
 	const { stdout } = await run(pi, ["rev-parse", "--short", "HEAD"], { signal });
 	return stdout.trim();

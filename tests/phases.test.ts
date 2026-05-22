@@ -203,6 +203,19 @@ describe("reconstructState", () => {
 		const state = await reconstructState(issue);
 		expect(state.phase).toBe("planning-red");
 		expect(state.plan).toBeUndefined();
+		expect(state.bailRedSha).toBeUndefined(); // no red-commit in comments
+	});
+
+	it("green-bail with preceding red-commit → planning-red with bailRedSha for git cleanup", async () => {
+		const issue = makeIssue([
+			makeComment("red-commit", { sha: "abc1234" }),
+			makeComment("plan-accepted", { phase: "planning-green" }, "green plan"),
+			makeComment("green-bail"),
+		]);
+		const state = await reconstructState(issue);
+		expect(state.phase).toBe("planning-red");
+		expect(state.bailRedSha).toBe("abc1234");
+		expect(state.plan).toBeUndefined();
 	});
 
 	it("final-commit → done", async () => {

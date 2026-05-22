@@ -47,7 +47,7 @@ import {
 	locksSteal,
 } from "./db.js";
 import { loadConfig } from "./config.js";
-import { addAll, commit, currentBranch, hasStagedChanges, headShortSha, isClean, resetHardHeadMinus1, showHeadDiff } from "./git.js";
+import { addAll, commit, currentBranch, hasStagedChanges, headShortSha, isClean, resetHardHeadMinus1, resetHardToRef, showHeadDiff } from "./git.js";
 import { formatIssueLabel, listEligible, pickFirstEligible } from "./issue-picker.js";
 import { type BogstandardState, type Phase, buildBsHeader, endReason, loadState, parseBsHeader, reconstructState, saveState } from "./phases.js";
 import {
@@ -193,6 +193,17 @@ export default function bogstandard(pi: ExtensionAPI) {
 		async execute(_id, params) {
 			state.bailReason = params.reason;
 			persist();
+			// Write green-bail to postgres immediately so reconstructState can detect
+			// the bail even if the session ends before handleBail runs (e.g. crash,
+			// or the user choosing "Not done, quitting" and resetting state to idle).
+			if (issue) {
+				try {
+					const header = buildBsHeader("green-bail");
+					await issueComment(pi, issue.id, "blocker", `${header}\n\n${params.reason}`);
+				} catch {
+					// non-fatal: handleBail will post again if this fails
+				}
+			}
 			return {
 				content: [
 					{
@@ -237,12 +248,16 @@ export default function bogstandard(pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			if (state.phase !== "idle" && state.phase !== "done") {
-				if (
-					state.phase === "implementing" ||
-					state.phase === "implementing-red" ||
-					state.phase === "implementing-green"
-				) {
+				if (state.phase === "implementing" || state.phase === "implementing-red") {
 					await handleImplementationEnd(ctx, false);
+					return;
+				}
+				if (state.phase === "implementing-green") {
+					if (state.bailReason !== undefined) {
+						await handleBail(ctx);
+					} else {
+						await handleImplementationEnd(ctx, false);
+					}
 					return;
 				}
 				ctx.ui.notify(
@@ -549,8 +564,16 @@ export default function bogstandard(pi: ExtensionAPI) {
 					return;
 				case "implementing":
 				case "implementing-red":
-				case "implementing-green":
 					await handleImplementationEnd(ctx, false);
+					return;
+				case "implementing-green":
+					// bail_out sets bailReason — skip the "Implementation complete" menu
+					// and go straight to bail handling so the user isn't offered "close and commit".
+					if (state.bailReason !== undefined) {
+						await handleBail(ctx);
+					} else {
+						await handleImplementationEnd(ctx, false);
+					}
 					return;
 				case "reviewing-red-plan":
 					if (state.plan) await handleRedPlanReview(ctx);
@@ -1221,9 +1244,25 @@ export default function bogstandard(pi: ExtensionAPI) {
 			case "planning":
 				await kickoffPhase(ctx, "planning", customTypeForPhase("planning"), buildPlanPrompt(issue), PLAN_TOOLS);
 				return;
-			case "planning-red":
+			case "planning-red": {
+				// When recovering after a bail, reset git to before the red commit so the
+				// history is clean for the next TDD cycle. bailRedSha is the short SHA of
+				// the red commit; resetting to its parent undoes it and any commits on top
+				// (e.g. a WIP commit from "Not done, quitting" before the session crashed).
+				if (state.bailRedSha) {
+					const sha = state.bailRedSha;
+					ctx.ui.notify(`Resetting git to before the red commit (${sha}) to clean up the aborted TDD cycle.`, "info");
+					try {
+						await resetHardToRef(pi, `${sha}~1`);
+					} catch (err) {
+						ctx.ui.notify(`Could not auto-reset to ${sha}~1: ${err}. Run 'git reset --hard ${sha}~1' manually before continuing.`, "warning");
+					}
+					state.bailRedSha = undefined;
+					persist();
+				}
 				await kickoffPhase(ctx, "planning-red", customTypeForPhase("planning-red"), buildRedPlanPrompt(issue), PLAN_TOOLS);
 				return;
+			}
 			case "planning-green": {
 				const diff = state.redDiff ?? "(unavailable — check `git log` for the red commit)";
 				await kickoffPhase(ctx, "planning-green", customTypeForPhase("planning-green"), buildGreenPlanPrompt(issue, diff), PLAN_TOOLS);
