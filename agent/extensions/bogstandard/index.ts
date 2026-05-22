@@ -749,7 +749,9 @@ export default function bogstandard(pi: ExtensionAPI) {
 				{ triggerTurn: false },
 			);
 		}
-		pi.sendMessage({ customType, content, display: false }, { triggerTurn: true, deliverAs: "followUp" });
+		setTimeout(() => {
+			pi.sendMessage({ customType, content, display: false }, { triggerTurn: true });
+		}, 0);
 	}
 
 	async function handleInterrupt(ctx: ExtensionContext): Promise<void> {
