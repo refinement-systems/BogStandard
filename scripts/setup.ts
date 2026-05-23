@@ -35,7 +35,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
-import { runner } from "node-pg-migrate";
+import { applyMigrations } from "./lib/migrations.js";
 
 const { Client } = pg;
 
@@ -128,26 +128,6 @@ async function createDatabase(adminUrl: string, dbName: string): Promise<void> {
 	} finally {
 		await client.end();
 	}
-}
-
-async function applyMigrations(url: string, migrationsDir: string): Promise<void> {
-	await runner({
-		databaseUrl: url,
-		dir: migrationsDir,
-		direction: "up",
-		migrationsTable: "pgmigrations",
-		// Sequential numeric prefixes (0001_, 0002_, …) rather than timestamps.
-		// node-pg-migrate logs a warning for non-timestamp prefixes; suppress it.
-		logger: {
-			debug: () => {},
-			info: (msg: unknown) => { console.log(msg); },
-			warn: (msg: unknown) => { console.warn(msg); },
-			error: (msg: unknown) => {
-				if (typeof msg === "string" && msg.includes("Can't determine timestamp")) return;
-				console.error(msg);
-			},
-		},
-	});
 }
 
 function writeConfig(

@@ -33,15 +33,27 @@ The wrapper creates the database if missing, runs `db/migrations/0001_init.sql`,
 | `BOGSTANDARD_AGENT_ID` | `agent_id` | Env override |
 | `.bogstandard/config.json` | `database_url`, `agent_id`, `stale_lock_timeout_minutes` | Default for the project |
 
-## Migrating from an existing chainlink project
+## Importing from an existing chainlink project
 
 From the target project's directory:
 
 ```bash
-/path/to/BogStandard/bin/bs-migrate         # defaults to ./.chainlink/issues.db
+/path/to/BogStandard/bin/bs-import          # defaults to ./.chainlink/issues.db
 ```
 
-Copies issues, comments, dependencies, and the `agent.json` agent id into the new Postgres database. Refuses to run against a non-empty target unless `--force` is passed.
+Copies issues, comments, dependencies, and the `agent.json` agent id into the new Postgres database. Refuses to run against a non-empty target unless `--force` is passed. This is a one-shot data import; for schema migrations see below.
+
+## Applying schema migrations
+
+When pulling a BogStandard update that adds new files under `db/migrations/`, bring the existing database up to date from the target project's directory:
+
+```bash
+/path/to/BogStandard/bin/bs-migrate         # uses .bogstandard/config.json
+```
+
+This runs `node-pg-migrate` against the configured database, recording applied migrations in the `pgmigrations` table. Databases created before commit `61b2df3` have no `pgmigrations` table; the first run will create it and treat `0001_init` as a no-op via `CREATE TABLE IF NOT EXISTS`, then apply any newer migrations.
+
+`bs-migrate` does not create the database — run `bs-setup` first for a new project.
 
 ## Running the workflow
 
@@ -158,15 +170,20 @@ SQL-touching paths (the eligibility query against a real database, lock claim/re
 ```
 bin/
   bs-setup                     # Wrapper: run setup.ts against the caller's cwd
-  bs-migrate                   # Wrapper: run migration against the caller's cwd
+  bs-migrate                   # Wrapper: apply pending schema migrations
+  bs-import                    # Wrapper: one-shot chainlink → postgres data import
   bs-list-eligible             # Wrapper: print eligible issue ids for the caller's cwd
 db/
   migrations/
     0001_init.sql              # Initial postgres schema
+    0002_draft_status.sql      # Add 'draft' to issues.status check constraint
 scripts/
   setup.ts                     # Create DB if missing, apply schema, write config.json
-  migrate-from-chainlink.ts    # Copy issues/comments/dependencies from .chainlink/issues.db
+  migrate.ts                   # Apply pending node-pg-migrate migrations
+  import-from-chainlink.ts     # Copy issues/comments/dependencies from .chainlink/issues.db
   list-eligible.ts             # Print eligible issue ids (used by dispatch.sh)
+  lib/
+    migrations.ts              # Shared node-pg-migrate runner used by setup.ts + migrate.ts
 agent/
   extensions/
     bogstandard/               # The pi extension (TypeScript)

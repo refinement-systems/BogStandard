@@ -51,13 +51,19 @@ bs-setup --database-url postgres://localhost:5432/bogstandard_myproject
 
 This creates the database if it doesn't already exist, applies the schema (`db/migrations/0001_init.sql`), and writes `.bogstandard/config.json` in the **target project's** directory with the connection string and a default `agent_id`. Make sure `.bogstandard/` is gitignored in your target project (or in your global gitignore).
 
-If the target project previously used chainlink, migrate the existing data:
+If the target project previously used chainlink, import the existing data:
 
 ```bash
-bs-migrate           # reads ./.chainlink/issues.db, writes to your postgres DB
+bs-import            # reads ./.chainlink/issues.db, writes to your postgres DB
 ```
 
-The chainlink CLI and its `.chainlink/` directory are no longer used after migration.
+The chainlink CLI and its `.chainlink/` directory are no longer used after import.
+
+When pulling a BogStandard update that adds new files under `db/migrations/`, bring the existing database up to date:
+
+```bash
+bs-migrate           # applies pending schema migrations to the configured DB
+```
 
 ## Configuration
 

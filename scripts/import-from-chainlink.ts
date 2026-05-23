@@ -14,18 +14,20 @@
  */
 
 /**
- * One-shot migrator: copy data from a chainlink SQLite DB into the BogStandard
- * postgres database.
+ * One-shot data importer: copy issues / comments / dependencies / agent
+ * config from a chainlink SQLite DB into the BogStandard postgres database.
  *
- *   npm run migrate -- [--source .chainlink/issues.db] \
- *                      [--agent-json .chainlink/agent.json] \
- *                      [--database-url <url>] \
- *                      [--force]
+ *   npm run import -- [--source .chainlink/issues.db] \
+ *                     [--agent-json .chainlink/agent.json] \
+ *                     [--database-url <url>] \
+ *                     [--force]
  *
  * Reads .bogstandard/config.json for the target connection if --database-url
  * is omitted. Refuses to run against a non-empty target unless --force is set.
  * Preserves issue / comment ids and bumps the postgres sequences afterwards
- * so subsequent inserts pick up where the migration left off.
+ * so subsequent inserts pick up where the import left off.
+ *
+ * Not to be confused with bs-migrate (schema migrations).
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -73,7 +75,7 @@ function parseArgs(argv: string[]): Args {
 			case "--help":
 			case "-h":
 				console.log(
-					"Usage: bs-migrate [--source <sqlite-path>] [--agent-json <path>] [--database-url <url>] [--force]\n" +
+					"Usage: bs-import [--source <sqlite-path>] [--agent-json <path>] [--database-url <url>] [--force]\n" +
 						"\nRun from the target project's directory. Source paths default to ./.chainlink/issues.db and ./.chainlink/agent.json.",
 				);
 				process.exit(0);
@@ -259,12 +261,12 @@ async function main(): Promise<void> {
 		await client.end();
 	}
 
-	console.log("\nMigration complete.");
+	console.log("\nImport complete.");
 }
 
 main().catch((err) => {
 	const e = err as { code?: string; message?: string; stack?: string } | undefined;
-	console.error("bs-migrate failed:");
+	console.error("bs-import failed:");
 	if (e?.code === "ECONNREFUSED") {
 		console.error(
 			"  Connection refused — is your postgres server running and reachable?\n" +
