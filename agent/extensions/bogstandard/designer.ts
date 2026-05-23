@@ -8,6 +8,11 @@
  * Tools are registered once at extension boot; `pi.setActiveTools(...)` in
  * the command handler limits the model to the Designer surface while the
  * session is in design mode.
+ *
+ * Draft workflow: `draft_issue` / `draft_subissue` create issues with
+ * status='draft'. After each agent turn that queued ≥1 draft, the operator
+ * reviews them one by one (approve / edit / skip). Skipped drafts are sent
+ * back to the agent with operator feedback for revision.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -19,13 +24,18 @@ import {
 	dependencyRemove,
 	issueArchive,
 	issueCreate,
+	issueDraftApprove,
 	issueListFiltered,
 	issueSetParent,
 	issueShowJson,
 	issueUpdate,
 	issueComment,
+	type IssueDetail,
 } from "./db.js";
 import { buildDesignerKickoffPrompt, buildDesignerSystemPrompt } from "./designer-prompts.js";
+import { showScrollableMarkdown } from "./scrollable-markdown.js";
+import { formatDraftForEdit, formatDraftForReview, parseDraftEditBuffer } from "./draft-edit.js";
+export { parseDraftEditBuffer } from "./draft-edit.js";
 
 const DESIGN_TOOLS = [
 	"read",
@@ -35,8 +45,8 @@ const DESIGN_TOOLS = [
 	"bash",
 	"list_issues",
 	"show_issue",
-	"create_issue",
-	"create_subissue",
+	"draft_issue",
+	"draft_subissue",
 	"update_issue",
 	"add_comment",
 	"block",
@@ -51,7 +61,12 @@ const PRIORITY_SCHEMA = Type.Union(
 );
 
 const STATUS_SCHEMA = Type.Union(
-	[Type.Literal("open"), Type.Literal("closed"), Type.Literal("archived")],
+	[
+		Type.Literal("open"),
+		Type.Literal("closed"),
+		Type.Literal("archived"),
+		Type.Literal("draft"),
+	],
 	{ description: "Issue status filter" },
 );
 
@@ -63,13 +78,19 @@ export interface RegisterDesignerOptions {
 	isTaskActive: () => boolean;
 }
 
+// ── Registration ─────────────────────────────────────────────────────────────
+
 export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions): void {
 	// Closure flag flipped on by /bs-design and consumed by before_agent_start
 	// to swap in the Designer system prompt. Not persisted across sessions —
 	// re-run /bs-design after `pi -r` to reactivate.
 	let designerActive = false;
 
-	registerDesignerTools(pi);
+	// IDs of drafts created during the current agent turn. Consumed and cleared
+	// by the agent_end handler that shows the review UI.
+	let pendingDraftIds: number[] = [];
+
+	registerDesignerTools(pi, () => pendingDraftIds);
 
 	pi.registerCommand("bs-design", {
 		description: "Brainstorm and create issues with a Designer agent",
@@ -99,17 +120,20 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 			}
 
 			let openIssues: Array<{ id: number; title: string; priority?: string; parent_id: number | null }> = [];
+			let draftIssues: Array<{ id: number; title: string; priority?: string; parent_id: number | null }> = [];
 			try {
 				openIssues = await issueListFiltered(pi, { status: "open" });
+				draftIssues = await issueListFiltered(pi, { status: "draft" });
 			} catch (err) {
-				ctx.ui.notify(`Failed to list open issues: ${err}`, "error");
+				ctx.ui.notify(`Failed to list issues: ${err}`, "error");
 				return;
 			}
 
 			designerActive = true;
+			pendingDraftIds = [];
 			pi.setActiveTools(DESIGN_TOOLS);
 
-			const kickoff = buildDesignerKickoffPrompt(openIssues);
+			const kickoff = buildDesignerKickoffPrompt(openIssues, draftIssues);
 			pi.sendMessage(
 				{ customType: "bs-design-kickoff", content: kickoff, display: false },
 				{ triggerTurn: true, deliverAs: "followUp" },
@@ -123,14 +147,108 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 		}
 		return undefined;
 	});
+
+	pi.on("agent_end", async (_event, ctx) => {
+		if (!designerActive || pendingDraftIds.length === 0) return;
+		const ids = [...pendingDraftIds];
+		pendingDraftIds = [];
+		await runDraftReviewLoop(ctx, ids);
+	});
+
+	async function runDraftReviewLoop(ctx: ExtensionContext, ids: number[]): Promise<void> {
+		const skippedIds: number[] = [];
+
+		for (const id of ids) {
+			let issue: IssueDetail;
+			try {
+				issue = await issueShowJson(pi, id);
+			} catch (err) {
+				ctx.ui.notify(`Failed to fetch draft #${id}: ${err}`, "error");
+				skippedIds.push(id);
+				continue;
+			}
+
+			let resolved = false;
+			while (!resolved) {
+				const action = await showScrollableMarkdown<"approve" | "edit" | "skip">(ctx, {
+					title: `Review draft #${id} — ${issue.title}`,
+					markdown: formatDraftForReview(issue),
+					actions: [
+						{ keyId: "return", label: "↵ approve", result: "approve" },
+						{ keyId: "e", label: "e edit", result: "edit" },
+						{ keyId: "escape", label: "esc skip", result: "skip" },
+					],
+				});
+
+				if (action === "approve") {
+					try {
+						await issueDraftApprove(pi, id);
+					} catch (err) {
+						ctx.ui.notify(`Failed to approve draft #${id}: ${err}`, "error");
+					}
+					resolved = true;
+				} else if (action === "skip") {
+					skippedIds.push(id);
+					resolved = true;
+				} else {
+					// edit: open editor with current content, loop until valid parse or cancel
+					let parsed: { title: string; priority: string; description: string } | null = null;
+					while (parsed === null) {
+						const buffer = await ctx.ui.editor("Edit draft:", formatDraftForEdit(issue));
+						if (buffer === undefined) {
+							// User cancelled the editor — leave as draft
+							skippedIds.push(id);
+							resolved = true;
+							break;
+						}
+						try {
+							parsed = parseDraftEditBuffer(buffer);
+						} catch (err) {
+							ctx.ui.notify(`Invalid format: ${err instanceof Error ? err.message : String(err)}`, "error");
+							// loop: re-open editor
+						}
+					}
+					if (parsed !== null) {
+						try {
+							await issueUpdate(pi, id, {
+								title: parsed.title,
+								description: parsed.description,
+								priority: parsed.priority,
+							});
+							issue = await issueShowJson(pi, id);
+						} catch (err) {
+							ctx.ui.notify(`Failed to update draft #${id}: ${err}`, "error");
+							skippedIds.push(id);
+							resolved = true;
+						}
+						// outer while continues: show the updated draft for approve/edit/skip
+					}
+				}
+			}
+		}
+
+		if (skippedIds.length === 0) {
+			ctx.ui.notify("All drafts approved.", "info");
+			return;
+		}
+
+		const skippedList = skippedIds.map((id) => `#${id}`).join(", ");
+		const feedback = await ctx.ui.editor(
+			`${skippedIds.length} draft(s) left pending (${skippedList}). Instructions for the agent to rework them (leave blank to end):`,
+			"",
+		);
+		if (feedback !== undefined && feedback.trim() !== "") {
+			pi.sendUserMessage(feedback.trim());
+		}
+	}
 }
 
-function registerDesignerTools(pi: ExtensionAPI): void {
+function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => number[]): void {
 	pi.registerTool({
 		name: "list_issues",
 		label: "List Issues",
 		description:
-			"List existing issues with optional filters. Defaults to listing all open issues. Use this to understand what already exists before proposing new issues.",
+			"List existing issues with optional filters. Defaults to listing all open and draft issues. Use this to understand what already exists before proposing new issues.",
 		parameters: Type.Object({
 			status: Type.Optional(STATUS_SCHEMA),
 			priority: Type.Optional(PRIORITY_SCHEMA),
@@ -142,7 +260,7 @@ function registerDesignerTools(pi: ExtensionAPI): void {
 		}),
 		async execute(_id, params) {
 			const issues = await issueListFiltered(pi, {
-				status: params.status ?? "open",
+				status: params.status,
 				priority: params.priority,
 				parent_id: params.parent_id,
 			});
@@ -172,10 +290,10 @@ function registerDesignerTools(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "create_issue",
-		label: "Create Issue",
+		name: "draft_issue",
+		label: "Queue Draft Issue",
 		description:
-			"Create a new top-level open issue. Confirm the title, description, and priority with the operator before calling.",
+			"Queue a new top-level issue as a draft for the operator to review. The operator will approve, edit, or defer it after this turn. Queue multiple drafts in one turn when the operator describes several related issues.",
 		parameters: Type.Object({
 			title: Type.String({ description: "Short, action-oriented title" }),
 			description: Type.Optional(
@@ -193,27 +311,29 @@ function registerDesignerTools(pi: ExtensionAPI): void {
 				title: params.title,
 				description: params.description,
 				priority: params.priority,
+				status: "draft",
 			});
 			for (const blockerId of params.block_on ?? []) {
 				await dependencyAdd(pi, newId, blockerId);
 			}
+			getPendingDraftIds().push(newId);
 			const blockMsg =
 				params.block_on && params.block_on.length > 0
 					? `, blocked by [${params.block_on.join(", ")}]`
 					: "";
 			return {
 				content: [
-					{ type: "text" as const, text: `Created issue #${newId} (${params.priority})${blockMsg}` },
+					{ type: "text" as const, text: `Queued draft #${newId} (${params.priority})${blockMsg}` },
 				],
 			};
 		},
 	});
 
 	pi.registerTool({
-		name: "create_subissue",
-		label: "Create Subissue",
+		name: "draft_subissue",
+		label: "Queue Draft Subissue",
 		description:
-			"Create a new open issue as a child of an existing parent. Use for tasks that are clearly part of a larger effort.",
+			"Queue a new draft issue as a child of an existing parent. Use for tasks that are clearly part of a larger effort.",
 		parameters: Type.Object({
 			parent_id: Type.Number({ description: "Existing parent issue id" }),
 			title: Type.String(),
@@ -227,15 +347,17 @@ function registerDesignerTools(pi: ExtensionAPI): void {
 				description: params.description,
 				priority: params.priority,
 				parent_id: params.parent_id,
+				status: "draft",
 			});
 			for (const blockerId of params.block_on ?? []) {
 				await dependencyAdd(pi, newId, blockerId);
 			}
+			getPendingDraftIds().push(newId);
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: `Created subissue #${newId} under #${params.parent_id} (${params.priority})`,
+						text: `Queued draft subissue #${newId} under #${params.parent_id} (${params.priority})`,
 					},
 				],
 			};

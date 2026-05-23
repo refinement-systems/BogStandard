@@ -17,10 +17,11 @@
  * overwrite an existing config.json unless --force is passed.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { runner } from "node-pg-migrate";
 
 const { Client } = pg;
 
@@ -115,15 +116,24 @@ async function createDatabase(adminUrl: string, dbName: string): Promise<void> {
 	}
 }
 
-async function applySchema(url: string, schemaSql: string): Promise<void> {
-	const client = new Client({ connectionString: url });
-	await client.connect();
-	try {
-		await client.query(schemaSql);
-		console.log("Applied schema (db/migrations/0001_init.sql).");
-	} finally {
-		await client.end();
-	}
+async function applyMigrations(url: string, migrationsDir: string): Promise<void> {
+	await runner({
+		databaseUrl: url,
+		dir: migrationsDir,
+		direction: "up",
+		migrationsTable: "pgmigrations",
+		// Sequential numeric prefixes (0001_, 0002_, …) rather than timestamps.
+		// node-pg-migrate logs a warning for non-timestamp prefixes; suppress it.
+		logger: {
+			debug: () => {},
+			info: (msg: unknown) => { console.log(msg); },
+			warn: (msg: unknown) => { console.warn(msg); },
+			error: (msg: unknown) => {
+				if (typeof msg === "string" && msg.includes("Can't determine timestamp")) return;
+				console.error(msg);
+			},
+		},
+	});
 }
 
 function writeConfig(
@@ -168,9 +178,8 @@ async function main(): Promise<void> {
 	const scriptDir = dirname(fileURLToPath(import.meta.url));
 	const bogstandardHome = resolve(scriptDir, "..");
 	const projectRoot = process.env.BS_PROJECT_ROOT ?? process.cwd();
-	const schemaPath = resolve(bogstandardHome, "db/migrations/0001_init.sql");
-	const schemaSql = readFileSync(schemaPath, "utf8");
-	await applySchema(databaseUrl, schemaSql);
+	const migrationsDir = resolve(bogstandardHome, "db/migrations");
+	await applyMigrations(databaseUrl, migrationsDir);
 
 	writeConfig(projectRoot, { databaseUrl, agentId: args.agentId, staleLockTimeoutMinutes: args.staleLockTimeoutMinutes }, args.force);
 

@@ -232,9 +232,10 @@ export interface IssueCreateInput {
 	description?: string;
 	priority: string;
 	parent_id?: number;
+	status?: string;
 }
 
-/** Insert a new open issue. Returns the new id. */
+/** Insert a new issue. Returns the new id. Status defaults to 'open'. */
 export async function issueCreate(
 	_pi: ExtensionAPI,
 	input: IssueCreateInput,
@@ -244,12 +245,26 @@ export async function issueCreate(
 		throw new Error("Issue title must not be empty");
 	}
 	const res = await getPool().query<{ id: string }>(
-		`INSERT INTO issues (title, description, priority, parent_id)
-		      VALUES ($1, $2, $3, $4)
+		`INSERT INTO issues (title, description, priority, parent_id, status)
+		      VALUES ($1, $2, $3, $4, $5)
 		   RETURNING id`,
-		[input.title, input.description ?? null, input.priority, input.parent_id ?? null],
+		[input.title, input.description ?? null, input.priority, input.parent_id ?? null, input.status ?? "open"],
 	);
 	return Number(res.rows[0].id);
+}
+
+/** Promote a draft issue to open. Throws if the issue is not in draft status. */
+export async function issueDraftApprove(
+	_pi: ExtensionAPI,
+	id: number,
+): Promise<void> {
+	const result = await getPool().query(
+		`UPDATE issues SET status = 'open', updated_at = now() WHERE id = $1 AND status = 'draft'`,
+		[id],
+	);
+	if (result.rowCount === 0) {
+		throw new Error(`Draft #${id} not found or not in draft status`);
+	}
 }
 
 export interface IssueUpdateInput {
@@ -362,7 +377,8 @@ export interface IssueListFilter {
 	parent_id?: number | null;
 }
 
-/** List issues with optional filters. Used by the Designer's `list_issues` tool. */
+/** List issues with optional filters. Used by the Designer's `list_issues` tool.
+ * When no status filter is specified, returns both 'open' and 'draft' issues. */
 export async function issueListFiltered(
 	_pi: ExtensionAPI,
 	filter: IssueListFilter = {},
@@ -372,6 +388,8 @@ export async function issueListFiltered(
 	if (filter.status !== undefined) {
 		params.push(filter.status);
 		clauses.push(`status = $${params.length}`);
+	} else {
+		clauses.push(`status IN ('open', 'draft')`);
 	}
 	if (filter.priority !== undefined) {
 		params.push(filter.priority);

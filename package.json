@@ -10,6 +10,7 @@
     "migrate": "tsx scripts/migrate-from-chainlink.ts"
   },
   "dependencies": {
+    "node-pg-migrate": "^7.9.1",
     "pg": "^8.13.1"
   },
   "devDependencies": {
