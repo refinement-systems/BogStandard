@@ -2,6 +2,11 @@
 
 The swamp level of agent orchestrators.
 
+Inspiration stolen shamelessly from:
+* [chainlink](https://github.com/dollspace-gay/chainlink)
+* [exomonad](https://github.com/tidepool-heavy-industries/exomonad)
+* possibly others that I don't remember
+
 # Structure
 
 BogStandard is a pi extension and an orchestrator script.
