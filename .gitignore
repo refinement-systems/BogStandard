@@ -2,3 +2,4 @@
 reference/*
 draft/*
 node_modules/*
+bin/*
