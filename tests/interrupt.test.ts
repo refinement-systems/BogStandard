@@ -105,4 +105,30 @@ describe("endReason", () => {
 			),
 		).toBe("tool-terminate");
 	});
+
+	it("returns interrupted on error during implementing", () => {
+		expect(endReason(makeEvent("error"), makeState({ phase: "implementing" }))).toBe("interrupted");
+	});
+
+	it("returns interrupted on error during red_impl", () => {
+		expect(endReason(makeEvent("error"), makeState({ phase: "red_impl" }))).toBe("interrupted");
+	});
+
+	it("returns interrupted on error during green_impl without bailReason", () => {
+		expect(endReason(makeEvent("error"), makeState({ phase: "green_impl" }))).toBe("interrupted");
+	});
+
+	it("returns interrupted on error during planning (no plan yet)", () => {
+		expect(endReason(makeEvent("error"), makeState({ phase: "planning" }))).toBe("interrupted");
+	});
+
+	it("returns interrupted on error during red_planning (no plan yet)", () => {
+		expect(endReason(makeEvent("error"), makeState({ phase: "red_planning" }))).toBe("interrupted");
+	});
+
+	it("bail_out during green_impl with error stopReason is still tool-terminate", () => {
+		expect(
+			endReason(makeEvent("error"), makeState({ phase: "green_impl", bailReason: "impossible" })),
+		).toBe("tool-terminate");
+	});
 });

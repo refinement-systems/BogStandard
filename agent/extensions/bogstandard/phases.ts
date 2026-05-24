@@ -197,7 +197,7 @@ export function reconstructFromEvents(
  * DB-backed.
  *
  *   tool-terminate — save_plan, bail_out, or propose_redraft ran
- *   interrupted    — user pressed Ctrl+C (stopReason "aborted" with no tool side-effect)
+ *   interrupted    — user Ctrl+C (stopReason "aborted") or transport/provider error ("error")
  *   completed      — natural finish or any other reason
  */
 export function endReason(
@@ -217,6 +217,6 @@ export function endReason(
 	}
 
 	const lastMsg = event.messages.at(-1);
-	if (lastMsg?.stopReason === "aborted") return "interrupted";
+	if (lastMsg?.stopReason === "aborted" || lastMsg?.stopReason === "error") return "interrupted";
 	return "completed";
 }

@@ -28,6 +28,8 @@
 import type { IssueDetail } from "./db.js";
 import { buildIssueDisplay } from "./db.js";
 
+const PLANNER_COMMENT_KINDS = new Set(["note", "decision", "observation", "human"]);
+
 export function buildPlannerSystemPrompt(): string {
 	return `You are a software architect. Your job is to explore the codebase, resolve ambiguities, and emit a plan. You do not write or modify code.
 
@@ -65,8 +67,17 @@ Additional tool:
 }
 
 function renderIssueBlock(issue: IssueDetail): string {
-	const json = JSON.stringify(issue, null, 2);
-	const display = buildIssueDisplay(issue);
+	const filteredComments = (issue.comments ?? []).filter((c) => PLANNER_COMMENT_KINDS.has(c.kind));
+	const sanitized = {
+		id: issue.id,
+		title: issue.title,
+		priority: issue.priority,
+		description: issue.description,
+		needs_tests: issue.needs_tests,
+		comments: filteredComments,
+	};
+	const json = JSON.stringify(sanitized, null, 2);
+	const display = buildIssueDisplay({ ...issue, comments: filteredComments });
 	const sections: string[] = [];
 	sections.push(`Issue #${issue.id}: ${issue.title}`);
 	if (display.trim() !== "") {
@@ -74,7 +85,7 @@ function renderIssueBlock(issue: IssueDetail): string {
 		sections.push(display);
 	}
 	sections.push("---");
-	sections.push("Raw JSON (fields: title, description, labels, comments, blocked_by, subissues):");
+	sections.push("Raw JSON (fields: title, description, priority, needs_tests, comments):");
 	sections.push("```json");
 	sections.push(json);
 	sections.push("```");
@@ -103,6 +114,7 @@ Rules for this phase:
 - Resolve every discoverable question by reading the repo before asking the user anything
 - Do not ask about facts that can be learned from the codebase or issue data
 - Do not call \`save_plan\` yet unless the issue is already decision-complete
+- If the issue description references work expected to be completed by prior subissues or dependencies, verify that those artifacts are present in the codebase. Do not assume DB state reflects codebase state. If expected artifacts are missing, call \`propose_redraft\` with a precise diagnosis — do not plan work that builds on an absent foundation.
 
 ## Phase 2 — Clarify with the user
 
@@ -221,6 +233,7 @@ Rules for this phase:
 - Resolve every discoverable question by reading the repo before asking the user anything
 - Do not ask about facts that can be learned from the codebase or issue data
 - Do not call \`save_plan\` yet unless the test design is already decision-complete
+- If the issue description references work completed by prior subissues, verify which parts of the described feature are already implemented. Only plan tests for behavior that is not yet present in the codebase — writing red tests for already-implemented code produces a green-from-the-start test suite, defeating the red/green cycle. If expected prerequisite artifacts are missing entirely, call \`propose_redraft\` with a precise diagnosis.
 
 ## Phase 2 — Clarify with the user
 
