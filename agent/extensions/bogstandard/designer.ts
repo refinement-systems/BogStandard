@@ -33,7 +33,6 @@ import {
 	issueCreate,
 	issueListFiltered,
 	issuePromoteToReady,
-	issueSetParent,
 	issueShowJson,
 	issueUpdate,
 	issueComment,
@@ -56,13 +55,11 @@ const DESIGN_TOOLS = [
 	"list_issues",
 	"show_issue",
 	"draft_issue",
-	"draft_subissue",
 	"update_issue",
 	"redraft_issue",
 	"add_comment",
 	"block",
 	"unblock",
-	"reparent",
 	"archive",
 ];
 
@@ -125,9 +122,9 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 				return;
 			}
 
-			let readyIssues: Array<{ id: number; title: string; priority?: string; parent_id: number | null }> = [];
-			let draftIssues: Array<{ id: number; title: string; priority?: string; parent_id: number | null }> = [];
-			let abortedRaw: Array<{ id: number; title: string; priority?: string; parent_id: number | null }> = [];
+			let readyIssues: Array<{ id: number; title: string; priority?: string }> = [];
+			let draftIssues: Array<{ id: number; title: string; priority?: string }> = [];
+			let abortedRaw: Array<{ id: number; title: string; priority?: string }> = [];
 			try {
 				readyIssues = await issueListFiltered(pi, { phase: "ready" });
 				draftIssues = await issueListFiltered(pi, { phase: "drafting" });
@@ -141,7 +138,6 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 				id: number;
 				title: string;
 				priority?: string;
-				parent_id: number | null;
 				aborted_reason?: string | null;
 			}> = [];
 			for (const ai of abortedRaw) {
@@ -277,24 +273,17 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 		parameters: Type.Object({
 			phase: Type.Optional(PHASE_SCHEMA),
 			priority: Type.Optional(PRIORITY_SCHEMA),
-			parent_id: Type.Optional(
-				Type.Union([Type.Number(), Type.Null()], {
-					description: "Filter by parent issue id; null lists only top-level issues",
-				}),
-			),
 		}),
 		async execute(_id, params) {
 			const issues = await issueListFiltered(pi, {
 				phase: params.phase as Phase | undefined,
 				priority: params.priority,
-				parent_id: params.parent_id,
 			});
 			if (issues.length === 0) {
 				return { content: [{ type: "text" as const, text: "(no issues matched the filter)" }] };
 			}
 			const lines = issues.map(
-				(i) =>
-					`#${i.id} ${i.priority} ${i.phase}${i.parent_id ? ` (subissue of #${i.parent_id})` : ""} — ${i.title}`,
+				(i) => `#${i.id} ${i.priority} ${i.phase} — ${i.title}`,
 			);
 			return { content: [{ type: "text" as const, text: lines.join("\n") }] };
 		},
@@ -304,7 +293,7 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 		name: "show_issue",
 		label: "Show Issue",
 		description:
-			"Fetch full detail for one issue: current version's title/description/needs_tests, comments scoped to the current version, subissues, and blockers. Pass include_history=true to also fetch all prior versions and their comments — use this before redrafting.",
+			"Fetch full detail for one issue: current version's title/description/needs_tests, comments scoped to the current version, and blockers. Pass include_history=true to also fetch all prior versions and their comments — use this before redrafting.",
 		parameters: Type.Object({
 			id: Type.Number({ description: "Issue id" }),
 			include_history: Type.Optional(
@@ -357,43 +346,6 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 			return {
 				content: [
 					{ type: "text" as const, text: `Queued draft #${newId} (${params.priority}, ${testsMsg})${blockMsg}` },
-				],
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "draft_subissue",
-		label: "Queue Draft Subissue",
-		description:
-			"Queue a new draft issue as a child of an existing parent. Use for tasks that are clearly part of a larger effort.",
-		parameters: Type.Object({
-			parent_id: Type.Number({ description: "Existing parent issue id" }),
-			title: Type.String(),
-			description: Type.Optional(Type.String()),
-			priority: PRIORITY_SCHEMA,
-			needs_tests: Type.Boolean(),
-			block_on: Type.Optional(Type.Array(Type.Number())),
-		}),
-		async execute(_id, params) {
-			const newId = await issueCreate(pi, {
-				title: params.title,
-				description: params.description,
-				priority: params.priority,
-				parent_id: params.parent_id,
-				needs_tests: params.needs_tests,
-			});
-			for (const blockerId of params.block_on ?? []) {
-				await dependencyAdd(pi, newId, blockerId);
-			}
-			getPendingDraftIds().push(newId);
-			const testsMsg = params.needs_tests ? "TDD" : "no-tests";
-			return {
-				content: [
-					{
-						type: "text" as const,
-						text: `Queued draft subissue #${newId} under #${params.parent_id} (${params.priority}, ${testsMsg})`,
-					},
 				],
 			};
 		},
@@ -516,21 +468,6 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 					{ type: "text" as const, text: `Removed block: #${params.blocker_id} → #${params.blocked_id}` },
 				],
 			};
-		},
-	});
-
-	pi.registerTool({
-		name: "reparent",
-		label: "Reparent",
-		description: "Set or clear an issue's parent. Pass parent_id=null to promote a subissue to top-level.",
-		parameters: Type.Object({
-			id: Type.Number(),
-			parent_id: Type.Union([Type.Number(), Type.Null()]),
-		}),
-		async execute(_id, params) {
-			await issueSetParent(pi, params.id, params.parent_id);
-			const where = params.parent_id === null ? "top-level" : `child of #${params.parent_id}`;
-			return { content: [{ type: "text" as const, text: `Issue #${params.id} is now ${where}` }] };
 		},
 	});
 

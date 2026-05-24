@@ -25,16 +25,14 @@ export function buildDesignerSystemPrompt(): string {
 Available tools:
 - read, grep, find, ls — explore the codebase for context (read-only)
 - bash — non-mutating inspection only (rg, cat, wc); no writes, no git, no direct database access
-- list_issues(phase?, priority?, parent_id?) — list existing issues (defaults to drafting + ready) so you understand what already exists
-- show_issue(id, include_history?) — fetch full detail (current version, comments scoped to it, subissues, blockers). Pass include_history=true to see prior versions and their comments — use this before redrafting.
-- draft_issue(title, description?, priority, needs_tests, block_on?) — queue a new top-level issue as a draft for the operator to review
-- draft_subissue(parent_id, title, description?, priority, needs_tests, block_on?) — queue a draft under an existing parent
+- list_issues(phase?, priority?) — list existing issues (defaults to drafting + ready) so you understand what already exists
+- show_issue(id, include_history?) — fetch full detail (current version, comments scoped to it, blockers). Pass include_history=true to see prior versions and their comments — use this before redrafting.
+- draft_issue(title, description?, priority, needs_tests, block_on?) — queue a new issue as a draft for the operator to review. Use \`block_on\` to express that this issue must wait for other issues to close, including when it is one piece of a larger effort tracked by another open issue.
 - update_issue(id, title?, description?, priority?, needs_tests?) — refine an existing issue. Title/description/needs_tests are only editable while the issue is in 'drafting' phase. Priority can be changed at any time.
 - redraft_issue(id, title, description, needs_tests, carry_forward_summary) — produce a new version of an issue. Allowed only when phase is drafting, ready, or aborted. The new version starts with a clean comment history; the carry_forward_summary you supply becomes the first comment on the new version. Use this to recover an 'aborted' issue.
 - add_comment(id, content) — append a note to an existing issue (scoped to the current version)
-- block(blocked_id, blocker_id) — record that one issue blocks another
+- block(blocked_id, blocker_id) — record that one issue blocks another. Rejected if it would close a cycle in the block graph.
 - unblock(blocked_id, blocker_id) — remove a block relationship
-- reparent(id, parent_id) — set or clear the parent of an issue (null promotes it to top-level)
 - archive(id) — mark an issue as archived (use when the operator decides not to pursue it)
 
 Issue lifecycle:
@@ -57,13 +55,13 @@ Rules:
 - Queue issues as drafts freely — the operator reviews each draft after your turn and approves, edits, or defers it. If any drafts are sent back with feedback, revise them and re-queue.
 - When redrafting an aborted issue, first read the prior version(s) with \`show_issue(id, include_history=true)\` so you can write an accurate carry_forward_summary. The summary should explain what was retained, what was changed, and why — this is the first thing the planner will read on the new version.
 - Prefer linking to existing issues over creating duplicates. If the operator's idea overlaps with an existing issue, propose updating that one instead.
-- When the operator changes their mind, use \`update_issue\`, \`unblock\`, \`reparent\`, or \`archive\` rather than expecting them to start a new session.
+- When the operator changes their mind, use \`update_issue\`, \`unblock\`, \`block\`, or \`archive\` rather than expecting them to start a new session.
 - Do not modify any source file, do not run git, and do not close or reopen issues — closing belongs to the implementation stage (\`/bs-task\`).
 - Keep descriptions terse but specific: enough for a future planner agent to understand the problem and what success looks like, without prescribing implementation details.
 - The session ends when the operator says they are done; you do not need to terminate explicitly.`;
 }
 
-type IssueEntry = { id: number; title: string; priority?: string; parent_id?: number | null };
+type IssueEntry = { id: number; title: string; priority?: string };
 
 /**
  * Kickoff message: renders open, draft, and aborted issue lists so the agent
@@ -91,8 +89,7 @@ export function buildDesignerKickoffPrompt(
 			lines.push("");
 			for (const i of readyIssues) {
 				const priority = i.priority ? ` ${i.priority}` : "";
-				const parent = i.parent_id ? ` (subissue of #${i.parent_id})` : "";
-				lines.push(`- #${i.id}${priority} — ${i.title}${parent}`);
+				lines.push(`- #${i.id}${priority} — ${i.title}`);
 			}
 			lines.push("");
 		}
@@ -101,8 +98,7 @@ export function buildDesignerKickoffPrompt(
 			lines.push("");
 			for (const i of draftIssues) {
 				const priority = i.priority ? ` ${i.priority}` : "";
-				const parent = i.parent_id ? ` (subissue of #${i.parent_id})` : "";
-				lines.push(`- #${i.id}${priority} — ${i.title}${parent}`);
+				lines.push(`- #${i.id}${priority} — ${i.title}`);
 			}
 			lines.push("");
 		}

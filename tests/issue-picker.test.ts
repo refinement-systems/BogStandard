@@ -15,6 +15,8 @@ import { describe, expect, it } from "vitest";
 import type { IssueListEntry, Phase } from "../agent/extensions/bogstandard/db.js";
 import {
 	ELIGIBLE_SQL,
+	FIND_CYCLE_SQL,
+	findBlockCycleWith,
 	type QueryRunner,
 	formatIssueLabel,
 	listEligibleWith,
@@ -82,6 +84,10 @@ describe("listEligibleWith", () => {
 		expect(ELIGIBLE_SQL).toMatch(/phase NOT IN \('done', 'archived'\)/);
 	});
 
+	it("eligibility SQL no longer references parent_id", () => {
+		expect(ELIGIBLE_SQL).not.toMatch(/parent_id/);
+	});
+
 	it("maps row.id to a number even when pg returns a bigint string", async () => {
 		const runner = runnerReturning([
 			{ id: "42" as unknown as number, title: "T", priority: "high", phase: "ready", needs_tests: true },
@@ -102,5 +108,45 @@ describe("listEligibleWith", () => {
 
 	it("returns empty array when the runner yields no rows", async () => {
 		expect(await listEligibleWith(runnerReturning([]), 60)).toEqual([]);
+	});
+});
+
+describe("FIND_CYCLE_SQL", () => {
+	it("uses a recursive walk over dependencies", () => {
+		expect(FIND_CYCLE_SQL).toMatch(/WITH RECURSIVE/);
+		expect(FIND_CYCLE_SQL).toMatch(/dependencies/);
+	});
+
+	it("starts every walk from each issue and looks for a self-revisit", () => {
+		expect(FIND_CYCLE_SQL).toMatch(/FROM issues/);
+		expect(FIND_CYCLE_SQL).toMatch(/d\.blocked_id = w\.start_id/);
+	});
+});
+
+describe("findBlockCycleWith", () => {
+	function pathRunner(path: number[] | null): QueryRunner {
+		return {
+			async query<R extends Record<string, unknown>>() {
+				if (path === null) return { rows: [] as R[] };
+				return { rows: [{ path } as unknown as R] };
+			},
+		};
+	}
+
+	it("returns null when no cycle is found", async () => {
+		expect(await findBlockCycleWith(pathRunner(null))).toBeNull();
+	});
+
+	it("coerces bigint-string ids back to numbers", async () => {
+		const runner: QueryRunner = {
+			async query<R extends Record<string, unknown>>() {
+				return { rows: [{ path: ["1", "2", "1"] } as unknown as R] };
+			},
+		};
+		expect(await findBlockCycleWith(runner)).toEqual([1, 2, 1]);
+	});
+
+	it("returns the cycle ids in walk order", async () => {
+		expect(await findBlockCycleWith(pathRunner([3, 4, 5, 3]))).toEqual([3, 4, 5, 3]);
 	});
 });

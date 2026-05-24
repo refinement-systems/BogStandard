@@ -36,6 +36,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import pg from "pg";
 import { loadConfig } from "../agent/extensions/bogstandard/config.js";
+import { FIND_CYCLE_SQL } from "../agent/extensions/bogstandard/issue-picker.js";
 
 const { Client } = pg;
 
@@ -140,11 +141,10 @@ async function migrateIssues(
 ): Promise<Map<number, number>> {
 	const issueIdToVersionId = new Map<number, number>();
 	if (rows.length === 0) return issueIdToVersionId;
-	// Two passes so parent_id FKs always resolve: first NULL parents, then patch.
 	for (const r of rows) {
 		await client.query(
-			`INSERT INTO issues (id, phase, priority, parent_id, created_at, updated_at, closed_at)
-			      VALUES ($1, $2, $3, NULL, $4, $5, $6)`,
+			`INSERT INTO issues (id, phase, priority, created_at, updated_at, closed_at)
+			      VALUES ($1, $2, $3, $4, $5, $6)`,
 			[
 				r.id,
 				chainlinkStatusToPhase(r.status),
@@ -167,12 +167,18 @@ async function migrateIssues(
 			[versionId, r.id],
 		);
 	}
+	// Convert chainlink parent_id into equivalent block edges (child blocks parent),
+	// matching the picker's prior semantics. Idempotent against any block edges
+	// that already exist in the source dependencies table.
+	let convertedParents = 0;
 	for (const r of rows) {
 		if (r.parent_id !== null && r.parent_id !== undefined) {
-			await client.query(`UPDATE issues SET parent_id = $1 WHERE id = $2`, [
-				r.parent_id,
-				r.id,
-			]);
+			const res = await client.query(
+				`INSERT INTO dependencies (blocker_id, blocked_id) VALUES ($1, $2)
+				 ON CONFLICT DO NOTHING`,
+				[r.id, r.parent_id],
+			);
+			convertedParents += res.rowCount ?? 0;
 		}
 	}
 	await client.query(
@@ -180,6 +186,9 @@ async function migrateIssues(
 	);
 	console.log(`  issues       : ${rows.length}`);
 	console.log(`  versions     : ${issueIdToVersionId.size}`);
+	if (convertedParents > 0) {
+		console.log(`  parent→block : ${convertedParents}`);
+	}
 	return issueIdToVersionId;
 }
 
@@ -217,6 +226,23 @@ async function migrateDeps(client: pg.Client, rows: ChainlinkDep[]): Promise<voi
 		);
 	}
 	console.log(`  dependencies : ${rows.length}`);
+}
+
+/**
+ * Run cycle detection against the imported block graph. The migration script
+ * makes the same check; we repeat it here because the importer bypasses
+ * `dependencyAdd`'s per-edge guard and writes both the chainlink dependency
+ * rows and any converted parent_id edges directly.
+ */
+async function assertNoCycles(client: pg.Client): Promise<void> {
+	const res = await client.query<{ path: Array<string | number> | null }>(FIND_CYCLE_SQL);
+	const path = res.rows[0]?.path;
+	if (path && path.length > 0) {
+		const formatted = path.map((v) => `#${v}`).join(" → ");
+		throw new Error(
+			`Imported block graph contains a cycle: ${formatted}. Rolled back; fix the source data and retry.`,
+		);
+	}
 }
 
 async function migrateAgentJson(client: pg.Client, agentJsonPath: string): Promise<void> {
@@ -287,6 +313,7 @@ async function main(): Promise<void> {
 			await migrateComments(client, comments, issueIdToVersionId);
 			await migrateDeps(client, deps);
 			await migrateAgentJson(client, resolve(projectRoot, args.agentJson));
+			await assertNoCycles(client);
 			await client.query("COMMIT");
 		} catch (err) {
 			await client.query("ROLLBACK");

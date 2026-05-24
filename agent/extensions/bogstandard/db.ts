@@ -128,11 +128,6 @@ export interface IssueComment {
 	content: string;
 }
 
-export interface Subissue {
-	id: number;
-	phase: Phase;
-}
-
 export interface IssueVersionSummary {
 	id: number;
 	version_no: number;
@@ -160,7 +155,6 @@ export interface IssueDetail {
 	current_agent_id?: string | null;
 	phase_started_at?: string | null;
 	comments?: IssueComment[];
-	subissues?: Subissue[];
 	blocked_by?: number[];
 	/** Populated only when explicitly requested (e.g. Designer redraft view). */
 	history?: Array<IssueVersionSummary & { comments: IssueComment[] }>;
@@ -247,14 +241,6 @@ export async function issueShowJson(
 		[row.current_version_id],
 	);
 
-	const subissuesRes = await p.query<{ id: string; phase: Phase }>(
-		`SELECT id, phase
-		   FROM issues
-		  WHERE parent_id = $1
-		  ORDER BY id`,
-		[id],
-	);
-
 	const blockersRes = await p.query<{ blocker_id: string }>(
 		`SELECT blocker_id
 		   FROM dependencies
@@ -275,7 +261,6 @@ export async function issueShowJson(
 		current_agent_id: row.current_agent_id,
 		phase_started_at: row.phase_started_at ? row.phase_started_at.toISOString() : null,
 		comments: commentsRes.rows.map((c) => ({ kind: c.kind, content: c.content })),
-		subissues: subissuesRes.rows.map((s) => ({ id: Number(s.id), phase: s.phase })),
 		blocked_by: blockersRes.rows.map((b) => Number(b.blocker_id)),
 	};
 
@@ -374,7 +359,6 @@ export interface IssueCreateInput {
 	title: string;
 	description?: string;
 	priority: string;
-	parent_id?: number;
 	needs_tests?: boolean;
 	/** Defaults to 'drafting'. Designer uses default; importers may pass others. */
 	phase?: Phase;
@@ -398,10 +382,10 @@ export async function issueCreate(
 	try {
 		await client.query("BEGIN");
 		const issueRes = await client.query<{ id: string }>(
-			`INSERT INTO issues (priority, parent_id, phase)
-			      VALUES ($1, $2, $3)
+			`INSERT INTO issues (priority, phase)
+			      VALUES ($1, $2)
 			   RETURNING id`,
-			[input.priority, input.parent_id ?? null, phase],
+			[input.priority, phase],
 		);
 		const issueId = Number(issueRes.rows[0].id);
 		const versionRes = await client.query<{ id: string }>(
@@ -554,21 +538,6 @@ export async function issueUpdate(
 	}
 }
 
-export async function issueSetParent(
-	_pi: ExtensionAPI,
-	id: number,
-	parentId: number | null,
-): Promise<void> {
-	if (parentId !== null && parentId === id) {
-		throw new Error("An issue cannot be its own parent");
-	}
-	const result = await getPool().query(
-		`UPDATE issues SET parent_id = $1, updated_at = now() WHERE id = $2`,
-		[parentId, id],
-	);
-	if (result.rowCount === 0) throw new Error(`Issue ${id} not found`);
-}
-
 /** Soft-delete: move the issue into phase='archived'. */
 export async function issueArchive(
 	_pi: ExtensionAPI,
@@ -684,6 +653,24 @@ export async function redraftIssue(
 	}
 }
 
+/**
+ * SQL for "would inserting edge (blockerId → blockedId) close a cycle?".
+ *
+ * The new edge means blockerId must close before blockedId. To close a cycle,
+ * a path must already exist from blockedId forward (following blocker→blocked)
+ * back to blockerId. Walk forward from $1 = blockedId, look for $2 = blockerId.
+ */
+export const CYCLE_CHECK_SQL = `
+	WITH RECURSIVE reachable(id) AS (
+	  SELECT $1::bigint
+	  UNION
+	  SELECT d.blocked_id
+	    FROM dependencies d
+	    JOIN reachable r ON d.blocker_id = r.id
+	)
+	SELECT 1 FROM reachable WHERE id = $2 LIMIT 1
+`;
+
 export async function dependencyAdd(
 	_pi: ExtensionAPI,
 	blockedId: number,
@@ -692,12 +679,23 @@ export async function dependencyAdd(
 	if (blockedId === blockerId) {
 		throw new Error("An issue cannot block itself");
 	}
+	const client = await getPool().connect();
 	try {
-		await getPool().query(
+		await client.query("BEGIN");
+		const cycle = await client.query(CYCLE_CHECK_SQL, [blockedId, blockerId]);
+		if ((cycle.rowCount ?? 0) > 0) {
+			throw new Error(
+				`Adding block ${blockerId} → ${blockedId} would close a cycle ` +
+					`(issue ${blockedId} already transitively blocks issue ${blockerId}).`,
+			);
+		}
+		await client.query(
 			`INSERT INTO dependencies (blocker_id, blocked_id) VALUES ($1, $2)`,
 			[blockerId, blockedId],
 		);
+		await client.query("COMMIT");
 	} catch (err) {
+		await client.query("ROLLBACK").catch(() => {});
 		const code = (err as { code?: string }).code;
 		if (code === "23505") {
 			throw new Error(`Issue ${blockedId} is already blocked by issue ${blockerId}`);
@@ -706,6 +704,8 @@ export async function dependencyAdd(
 			throw new Error(`Either issue ${blockedId} or ${blockerId} does not exist`);
 		}
 		throw err;
+	} finally {
+		client.release();
 	}
 }
 
@@ -726,7 +726,6 @@ export async function dependencyRemove(
 export interface IssueListFilter {
 	phase?: Phase | Phase[];
 	priority?: string;
-	parent_id?: number | null;
 }
 
 /**
@@ -736,7 +735,7 @@ export interface IssueListFilter {
 export async function issueListFiltered(
 	_pi: ExtensionAPI,
 	filter: IssueListFilter = {},
-): Promise<Array<IssueListEntry & { parent_id: number | null }>> {
+): Promise<IssueListEntry[]> {
 	const clauses: string[] = [];
 	const params: unknown[] = [];
 
@@ -754,14 +753,6 @@ export async function issueListFiltered(
 		params.push(filter.priority);
 		clauses.push(`i.priority = $${params.length}`);
 	}
-	if (filter.parent_id !== undefined) {
-		if (filter.parent_id === null) {
-			clauses.push(`i.parent_id IS NULL`);
-		} else {
-			params.push(filter.parent_id);
-			clauses.push(`i.parent_id = $${params.length}`);
-		}
-	}
 
 	const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
 	const res = await getPool().query<{
@@ -769,9 +760,8 @@ export async function issueListFiltered(
 		title: string;
 		phase: Phase;
 		priority: string;
-		parent_id: string | null;
 	}>(
-		`SELECT i.id, v.title, i.phase, i.priority, i.parent_id
+		`SELECT i.id, v.title, i.phase, i.priority
 		   FROM issues i
 		   JOIN issue_versions v ON v.id = i.current_version_id
 		   ${where}
@@ -784,7 +774,6 @@ export async function issueListFiltered(
 		phase: r.phase,
 		priority: r.priority,
 		status: r.phase,
-		parent_id: r.parent_id === null ? null : Number(r.parent_id),
 	}));
 }
 

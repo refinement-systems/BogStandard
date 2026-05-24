@@ -3,7 +3,7 @@
 BogStandard automates a two-phase plan→implement loop for issues tracked in a managed Postgres database. It runs as a [pi](https://github.com/earendil-works/pi) extension exposing two commands:
 
 - `/bs-task` drives the full plan→implement flow — issue review, planning, optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
-- `/bs-design` opens a separate conversational Designer session for brainstorming and creating new issues (create, update, comment, block, subissue, reparent, archive). The Designer never closes issues; closing belongs to `/bs-task`.
+- `/bs-design` opens a separate conversational Designer session for brainstorming and creating new issues (create, update, comment, block, unblock, archive). The Designer never closes issues; closing belongs to `/bs-task`.
 
 ## One-time setup
 
@@ -70,9 +70,11 @@ pi -e ./agent/extensions/bogstandard /bs-task
 pi -e ./agent/extensions/bogstandard /bs-task 42
 ```
 
-**`/bs-design`** runs a conversational Designer agent with a tool surface limited to issue CRUD: `list_issues`, `show_issue`, `create_issue`, `create_subissue`, `update_issue`, `add_comment`, `block`, `unblock`, `reparent`, `archive`. It is stateless across pi sessions — re-run any time to continue brainstorming. The Designer does not modify source files, run git, or close issues.
+**`/bs-design`** runs a conversational Designer agent with a tool surface limited to issue CRUD: `list_issues`, `show_issue`, `draft_issue`, `update_issue`, `redraft_issue`, `add_comment`, `block`, `unblock`, `archive`. It is stateless across pi sessions — re-run any time to continue brainstorming. The Designer does not modify source files, run git, or close issues.
 
-**`/bs-task` auto-pick** selects the first open issue with no open subissues and no open blockers, sorted by priority (critical → high → medium → low) then by id. The issue review screen lets you continue, add a comment, switch to a different issue, or abort.
+Issue hierarchy is expressed entirely through the block graph (`dependencies`): if issue B should wait for issue A, call `block(blocked_id=B, blocker_id=A)`. There is no separate parent/subissue relation. `block` rejects edges that would close a cycle (recursive-CTE check); the picker re-checks for cycles whenever it returns no eligible issues and surfaces the offending ids.
+
+**`/bs-task` auto-pick** selects the first open issue with no open blockers, sorted by priority (critical → high → medium → low) then by id. The issue review screen lets you continue, add a comment, switch to a different issue, or abort.
 
 **`/bs-task` with an explicit issue id** skips the auto-pick and goes straight to review for that issue.
 
@@ -156,9 +158,10 @@ npm test
 
 Runs unit tests covering the pure-logic modules:
 - `phases.ts` — state loading/saving and all phase transitions
-- `issue-picker.ts` — eligibility SQL and row mapping (against a query-runner stub)
+- `issue-picker.ts` — eligibility SQL, row mapping, `FIND_CYCLE_SQL` shape, and `findBlockCycleWith` (against query-runner stubs)
 - `prompts.ts` — all six prompt builders (no-tests, red plan, red impl, green plan, green impl)
 - `db.ts` — `buildIssueDisplay` formatting and `isLockStale` boundary checks
+- `dependency-cycle.ts` — `CYCLE_CHECK_SQL` shape (parameter direction, recursive walk, LIMIT)
 - `config.ts` — flag → env → file precedence
 - `phases.ts` (interrupt) — `endReason` session stop-reason detection
 - `scroll-math.ts` — scrollable-markdown viewer offset/page clamping
@@ -177,6 +180,8 @@ db/
   migrations/
     0001_init.sql              # Initial postgres schema
     0002_draft_status.sql      # Add 'draft' to issues.status check constraint
+    0003_phase_state_and_versioning.sql  # Issue-centric phase machine + issue_versions
+    0004_drop_parent_id.sql    # Collapse parent_id into dependencies; verify acyclic
 scripts/
   setup.ts                     # Create DB if missing, apply schema, write config.json
   migrate.ts                   # Apply pending node-pg-migrate migrations
@@ -191,9 +196,9 @@ agent/
       designer.ts                # /bs-design command + Designer tools (create/update/block/etc.)
       designer-prompts.ts        # Designer system prompt + kickoff message
       config.ts                  # Flag/env/file config resolution
-      db.ts                      # Postgres adapter (issue CRUD, locks, dependencies)
+      db.ts                      # Postgres adapter (issue CRUD, ownership, dependencies + CYCLE_CHECK_SQL guard)
       git.ts                     # Typed wrappers over pi.exec("git", ...)
-      issue-picker.ts            # Eligibility query (single SQL) + label formatting
+      issue-picker.ts            # Eligibility query, FIND_CYCLE_SQL, findBlockCycle diagnostic, label formatting
       phases.ts                  # /bs-task phase state types, loadState / saveState
       prompts.ts                 # All six /bs-task prompt builders (inline content, no temp files)
       questionnaire.ts           # Questionnaire tool for plan-phase clarifying questions
@@ -211,6 +216,7 @@ tests/
   config.test.ts                 # Unit tests for config precedence
   scroll-math.test.ts            # Unit tests for scroll-offset helpers
   designer.test.ts               # Unit tests for assertPriority + Designer prompt builders
+  dependency-cycle.test.ts       # Unit tests for CYCLE_CHECK_SQL shape
 package.json                   # vitest + pg + better-sqlite3 + tsx
 dispatch.sh                    # Multi-worker dispatcher (postgres-backed)
 vitest.config.ts

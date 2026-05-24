@@ -15,7 +15,7 @@ BogStandard is a pi extension and an orchestrator script.
 
 * The extension automates a two-phase `plan → implement` loop for issues stored in a managed Postgres database. It runs as a [pi](https://github.com/earendil-works/pi) extension exposing two commands:
   * `/bs-task` drives issue review, planning (with interactive refinement), optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
-  * `/bs-design` opens a conversational Designer session for brainstorming and seeding new issues into the database (create, update, block, subissue, archive — but not close, since that belongs to `/bs-task`).
+  * `/bs-design` opens a conversational Designer session for brainstorming and seeding new issues into the database (create, update, block, unblock, archive — but not close, since that belongs to `/bs-task`).
 * The script runs multiple sessions in parallel, picking the appropriate issues.
 
 ## Requirements
@@ -96,11 +96,13 @@ pi -e ./agent/extensions/bogstandard /bs-task
 
 ### Designer (`/bs-design`)
 
-`/bs-design` opens a conversational session for filling the backlog. The agent has read-only access to the codebase plus a tool set scoped to issue creation and refinement: `list_issues`, `show_issue`, `create_issue`, `create_subissue`, `update_issue`, `add_comment`, `block`, `unblock`, `reparent`, and `archive`. Closing and reopening are intentionally absent — those belong to `/bs-task`. The Designer is stateless across sessions; re-run `/bs-design` any time to keep brainstorming.
+`/bs-design` opens a conversational session for filling the backlog. The agent has read-only access to the codebase plus a tool set scoped to issue creation and refinement: `list_issues`, `show_issue`, `draft_issue`, `update_issue`, `redraft_issue`, `add_comment`, `block`, `unblock`, and `archive`. Closing and reopening are intentionally absent — those belong to `/bs-task`. The Designer is stateless across sessions; re-run `/bs-design` any time to keep brainstorming.
+
+Issue hierarchy lives in the block graph alone — there is no separate parent/subissue relation. When an issue is one piece of a larger effort, express that by blocking the parent on it: `block(blocked_id=parent, blocker_id=child)`. The `block` tool rejects edges that would close a cycle, and the picker re-checks for cycles whenever it returns no eligible work (surfacing the offending ids).
 
 ### Issue selection
 
-**Auto-pick** (no argument) selects the first open issue with no open subissues and no open blockers, sorted by priority (critical → high → medium → low) then by id ascending. The issue review screen lets you continue, add a comment, switch to a different issue, or abort.
+**Auto-pick** (no argument) selects the first open issue with no open blockers, sorted by priority (critical → high → medium → low) then by id ascending. The issue review screen lets you continue, add a comment, switch to a different issue, or abort.
 
 **Explicit issue** (numeric argument) skips auto-pick and goes straight to review.
 
@@ -191,7 +193,7 @@ SELECT id, priority, title
           id;
 ```
 
-**Ready / eligible issues** — open, no open subissues, no open blockers. This is the same query the auto-picker and `bs-list-eligible` use (see `ELIGIBLE_SQL` in `agent/extensions/bogstandard/issue-picker.ts`), so the result should match `bs-list-eligible` exactly:
+**Ready / eligible issues** — open, no open blockers. This is the same query the auto-picker and `bs-list-eligible` use (see `ELIGIBLE_SQL` in `agent/extensions/bogstandard/issue-picker.ts`), so the result should match `bs-list-eligible` exactly:
 
 ```sql
 SELECT i.id, i.title, i.priority, i.status
@@ -202,10 +204,6 @@ SELECT i.id, i.title, i.priority, i.status
            FROM dependencies d
            JOIN issues b ON d.blocker_id = b.id
           WHERE d.blocked_id = i.id AND b.status = 'open')
-   AND NOT EXISTS (
-         SELECT 1
-           FROM issues s
-          WHERE s.parent_id = i.id AND s.status = 'open')
  ORDER BY CASE i.priority
             WHEN 'critical' THEN 0
             WHEN 'high'     THEN 1
@@ -226,15 +224,20 @@ SELECT i.id AS blocked, i.title, b.id AS blocker, b.title AS blocker_title
  ORDER BY i.id;
 ```
 
-**Open issues that still have open subissues**
+**Detect cycles in the block graph**
 
 ```sql
-SELECT p.id, p.title, COUNT(s.id) AS open_subissues
-  FROM issues p
-  JOIN issues s ON s.parent_id = p.id
- WHERE p.status = 'open' AND s.status = 'open'
- GROUP BY p.id, p.title
- ORDER BY p.id;
+WITH RECURSIVE walk(start_id, current_id, path, found) AS (
+  SELECT id, id, ARRAY[id]::bigint[], false FROM issues
+  UNION ALL
+  SELECT w.start_id, d.blocked_id, w.path || d.blocked_id, d.blocked_id = w.start_id
+    FROM walk w
+    JOIN dependencies d ON d.blocker_id = w.current_id
+   WHERE NOT w.found
+     AND array_length(w.path, 1) < 200
+     AND NOT (d.blocked_id = ANY(w.path) AND d.blocked_id <> w.start_id)
+)
+SELECT path FROM walk WHERE found LIMIT 1;
 ```
 
 **Currently held locks — which worker is on what**

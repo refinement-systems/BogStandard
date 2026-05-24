@@ -18,7 +18,6 @@
  *   - phase = 'ready'
  *   - current version's needs_tests is set (NOT NULL) — Designer classified it
  *   - not currently claimed (current_agent_id IS NULL) or stale heartbeat
- *   - no subissues in a not-yet-resolved phase
  *   - no blockers in a not-yet-resolved phase
  *
  * "Not yet resolved" means phase NOT IN ('done', 'archived'). Aborted issues
@@ -26,6 +25,12 @@
  * need redraft + completion to release downstream work.
  *
  * Sort order: priority (critical → high → medium → low → other) then id.
+ *
+ * `findBlockCycle` is the second-line diagnostic: when the picker returns
+ * nothing the caller invokes it to distinguish "no work scheduled" from
+ * "the block graph has a cycle and is deadlocked". `dependencyAdd` rejects
+ * cycles at insertion time, but the importer and manual SQL can still
+ * introduce them, so the picker keeps a runtime check.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -52,11 +57,6 @@ export const ELIGIBLE_SQL = `
 	           JOIN issues b ON d.blocker_id = b.id
 	          WHERE d.blocked_id = i.id
 	            AND b.phase NOT IN ('done', 'archived'))
-	   AND NOT EXISTS (
-	         SELECT 1
-	           FROM issues s
-	          WHERE s.parent_id = i.id
-	            AND s.phase NOT IN ('done', 'archived'))
 	 ORDER BY CASE i.priority
 	            WHEN 'critical' THEN 0
 	            WHEN 'high'     THEN 1
@@ -64,6 +64,28 @@ export const ELIGIBLE_SQL = `
 	            WHEN 'low'      THEN 3
 	            ELSE 4
 	          END, i.id
+`;
+
+/**
+ * Recursive walk over `dependencies`: for every issue, follow blocker→blocked
+ * edges until we re-enter the start node (cycle) or exhaust the frontier.
+ * `array_length(path, 1) < 200` is a safety bound — real graphs are tiny.
+ */
+export const FIND_CYCLE_SQL = `
+	WITH RECURSIVE walk(start_id, current_id, path, found) AS (
+	  SELECT id, id, ARRAY[id]::bigint[], false FROM issues
+	  UNION ALL
+	  SELECT w.start_id,
+	         d.blocked_id,
+	         w.path || d.blocked_id,
+	         d.blocked_id = w.start_id
+	    FROM walk w
+	    JOIN dependencies d ON d.blocker_id = w.current_id
+	   WHERE NOT w.found
+	     AND array_length(w.path, 1) < 200
+	     AND NOT (d.blocked_id = ANY(w.path) AND d.blocked_id <> w.start_id)
+	)
+	SELECT path FROM walk WHERE found LIMIT 1
 `;
 
 interface EligibleRow extends Record<string, unknown> {
@@ -98,6 +120,22 @@ export async function pickFirstEligible(
 ): Promise<IssueListEntry | undefined> {
 	const all = await listEligible(pi, staleLockTimeoutMinutes);
 	return all[0];
+}
+
+/**
+ * Walks the block graph looking for any cycle. Returns the ids that form a
+ * sample cycle (start node repeated at the end), or null when the graph is
+ * acyclic. Cheap on small graphs; bounded to depth 200 by the CTE.
+ */
+export async function findBlockCycleWith(runner: QueryRunner): Promise<number[] | null> {
+	const res = await runner.query<{ path: Array<string | number> | null }>(FIND_CYCLE_SQL);
+	const path = res.rows[0]?.path;
+	if (!path || path.length === 0) return null;
+	return path.map((v) => Number(v));
+}
+
+export async function findBlockCycle(_pi: ExtensionAPI): Promise<number[] | null> {
+	return findBlockCycleWith(getPool());
 }
 
 /** "#42 critical — Issue title" */

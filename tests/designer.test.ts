@@ -43,17 +43,20 @@ describe("buildDesignerSystemPrompt", () => {
 			"list_issues",
 			"show_issue",
 			"draft_issue",
-			"draft_subissue",
 			"update_issue",
 			"redraft_issue",
 			"add_comment",
 			"block",
 			"unblock",
-			"reparent",
 			"archive",
 		]) {
 			expect(prompt).toContain(tool);
 		}
+	});
+
+	it("does not advertise the removed draft_subissue or reparent tools", () => {
+		expect(prompt).not.toContain("draft_subissue");
+		expect(prompt).not.toContain("reparent");
 	});
 
 	it("describes creation tools as queuing drafts", () => {
@@ -87,7 +90,7 @@ describe("buildDesignerKickoffPrompt", () => {
 
 	it("renders each ready issue with id, priority, and title", () => {
 		const out = buildDesignerKickoffPrompt(
-			[{ id: 7, title: "Add login", priority: "high", parent_id: null }],
+			[{ id: 7, title: "Add login", priority: "high" }],
 			[],
 			[],
 		);
@@ -96,19 +99,10 @@ describe("buildDesignerKickoffPrompt", () => {
 		expect(out).toContain("Add login");
 	});
 
-	it("marks subissues with their parent id", () => {
-		const out = buildDesignerKickoffPrompt(
-			[{ id: 12, title: "Form validation", priority: "medium", parent_id: 7 }],
-			[],
-			[],
-		);
-		expect(out).toContain("subissue of #7");
-	});
-
 	it("renders a separate Pending drafts section when drafts exist", () => {
 		const out = buildDesignerKickoffPrompt(
-			[{ id: 3, title: "Open issue", priority: "low", parent_id: null }],
-			[{ id: 5, title: "Draft thing", priority: "high", parent_id: null }],
+			[{ id: 3, title: "Open issue", priority: "low" }],
+			[{ id: 5, title: "Draft thing", priority: "high" }],
 			[],
 		);
 		expect(out).toMatch(/pending drafts/i);
@@ -125,7 +119,6 @@ describe("buildDesignerKickoffPrompt", () => {
 					id: 42,
 					title: "Bouncy task",
 					priority: "high",
-					parent_id: null,
 					aborted_reason: "design contradicts existing API",
 				},
 			],
@@ -139,7 +132,7 @@ describe("buildDesignerKickoffPrompt", () => {
 		const out = buildDesignerKickoffPrompt(
 			[],
 			[],
-			[{ id: 42, title: "Bouncy", priority: "high", parent_id: null, aborted_reason: null }],
+			[{ id: 42, title: "Bouncy", priority: "high", aborted_reason: null }],
 		);
 		expect(out).toContain("#42");
 		expect(out).toContain("Bouncy");

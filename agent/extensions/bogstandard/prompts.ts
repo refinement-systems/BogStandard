@@ -114,7 +114,7 @@ Rules for this phase:
 - Resolve every discoverable question by reading the repo before asking the user anything
 - Do not ask about facts that can be learned from the codebase or issue data
 - Do not call \`save_plan\` yet unless the issue is already decision-complete
-- If the issue description references work expected to be completed by prior subissues or dependencies, verify that those artifacts are present in the codebase. Do not assume DB state reflects codebase state. If expected artifacts are missing, call \`propose_redraft\` with a precise diagnosis — do not plan work that builds on an absent foundation.
+- If the issue description references work expected to be completed by prior blocking issues, verify that those artifacts are present in the codebase. Do not assume DB state reflects codebase state. If expected artifacts are missing, call \`propose_redraft\` with a precise diagnosis — do not plan work that builds on an absent foundation.
 
 ## Phase 2 — Clarify with the user
 
@@ -233,7 +233,7 @@ Rules for this phase:
 - Resolve every discoverable question by reading the repo before asking the user anything
 - Do not ask about facts that can be learned from the codebase or issue data
 - Do not call \`save_plan\` yet unless the test design is already decision-complete
-- If the issue description references work completed by prior subissues, verify which parts of the described feature are already implemented. Only plan tests for behavior that is not yet present in the codebase — writing red tests for already-implemented code produces a green-from-the-start test suite, defeating the red/green cycle. If expected prerequisite artifacts are missing entirely, call \`propose_redraft\` with a precise diagnosis.
+- If the issue description references work completed by prior blocking issues, verify which parts of the described feature are already implemented. Only plan tests for behavior that is not yet present in the codebase — writing red tests for already-implemented code produces a green-from-the-start test suite, defeating the red/green cycle. If expected prerequisite artifacts are missing entirely, call \`propose_redraft\` with a precise diagnosis.
 
 ## Phase 2 — Clarify with the user
 

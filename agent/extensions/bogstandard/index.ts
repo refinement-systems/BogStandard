@@ -45,6 +45,7 @@ import {
 	appendPhaseEvent,
 	recentPhaseEvents,
 	isPhaseStale,
+	issueArchive,
 	issueComment,
 	issueShowJson,
 	type IssueDetail,
@@ -53,7 +54,7 @@ import {
 } from "./db.js";
 import { loadConfig } from "./config.js";
 import { addAll, commit, hasStagedChanges, headShortSha, isClean, resetHardHeadMinus1, resetHardToRef, showHeadDiff, statusShort } from "./git.js";
-import { formatIssueLabel, listEligible, pickFirstEligible } from "./issue-picker.js";
+import { findBlockCycle, formatIssueLabel, listEligible, pickFirstEligible } from "./issue-picker.js";
 import { IDLE_STATE, isMidWorkPhase, loadState, loadStateForIssue, endReason, type BogstandardState } from "./phases.js";
 import {
 	buildGreenImplementPrompt,
@@ -315,7 +316,19 @@ export default function bogstandard(pi: ExtensionAPI) {
 					return;
 				}
 				if (!picked) {
-					ctx.ui.notify("No eligible issues found. Run /bs-design to draft or classify some.", "warning");
+					let cycleNote = "";
+					try {
+						const cycle = await findBlockCycle(pi);
+						if (cycle && cycle.length > 0) {
+							cycleNote = ` Block-graph cycle detected: ${cycle.map((id) => `#${id}`).join(" → ")}. Run /bs-design and use unblock to break it.`;
+						}
+					} catch {
+						// non-fatal: best-effort diagnostic
+					}
+					ctx.ui.notify(
+						`No eligible issues found.${cycleNote} Run /bs-design to draft or classify some.`,
+						"warning",
+					);
 					return;
 				}
 			}
@@ -463,13 +476,14 @@ export default function bogstandard(pi: ExtensionAPI) {
 
 	async function runIssueReviewLoop(ctx: ExtensionContext): Promise<boolean> {
 		while (issue) {
-			const action = await showScrollableMarkdown<"continue" | "comment" | "show" | "abort">(ctx, {
+			const action = await showScrollableMarkdown<"continue" | "comment" | "show" | "archive" | "abort">(ctx, {
 				title: `Issue #${issue.id} — ${formatIssueLabel(issue)}`,
 				markdown: buildIssueDisplay(issue),
 				actions: [
 					{ keyId: "return", label: "↵ continue", result: "continue" },
 					{ keyId: "c", label: "c comment", result: "comment" },
 					{ keyId: "s", label: "s show others", result: "show" },
+					{ keyId: "a", label: "a archive", result: "archive" },
 					{ keyId: "escape", label: "esc abort", result: "abort" },
 				],
 			});
@@ -477,6 +491,16 @@ export default function bogstandard(pi: ExtensionAPI) {
 			if (action === "abort") {
 				ctx.ui.notify("Aborted before planning.", "info");
 				return false;
+			}
+			if (action === "archive") {
+				try {
+					await issueArchive(pi, issue.id, await getAgentId(pi));
+					ctx.ui.notify(`Issue #${issue.id} archived.`, "info");
+					return false;
+				} catch (err) {
+					ctx.ui.notify(`Failed to archive issue: ${err}`, "error");
+				}
+				continue;
 			}
 			if (action === "comment") {
 				const body = await ctx.ui.editor("Comment:", "");

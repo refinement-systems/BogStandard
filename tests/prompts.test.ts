@@ -44,7 +44,6 @@ const ISSUE: IssueDetail = {
 		{ kind: "handoff", content: "Handed off to worker-2." },
 	],
 	blocked_by: [7],
-	subissues: [{ id: 10, phase: "done" }],
 };
 
 const PLAN = "# Plan\n\nStep 1: do the thing.";
@@ -73,10 +72,9 @@ describe("buildPlanPrompt", () => {
 		expect(buildPlanPrompt(ISSUE)).not.toContain("opted out of tests");
 	});
 
-	it("strips blocked_by and subissues from the JSON block", () => {
+	it("strips blocked_by from the JSON block", () => {
 		const prompt = buildPlanPrompt(ISSUE);
 		expect(prompt).not.toContain('"blocked_by"');
-		expect(prompt).not.toContain('"subissues"');
 	});
 
 	it("includes allowed comment kinds in the prompt", () => {
@@ -133,10 +131,9 @@ describe("buildRedPlanPrompt", () => {
 		expect(prompt).toContain("Do NOT plan any production-code changes");
 	});
 
-	it("strips blocked_by and subissues from the JSON block", () => {
+	it("strips blocked_by from the JSON block", () => {
 		const prompt = buildRedPlanPrompt(ISSUE);
 		expect(prompt).not.toContain('"blocked_by"');
-		expect(prompt).not.toContain('"subissues"');
 	});
 
 	it("strips disallowed comment kinds from the prompt", () => {
