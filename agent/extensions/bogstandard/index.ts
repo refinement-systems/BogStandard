@@ -767,7 +767,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 			// non-fatal
 		}
 		state.plan = undefined;
-		pi.sendUserMessage(refinement.trim());
+		setTimeout(() => pi.sendUserMessage(refinement.trim()), 0);
 	}
 
 	async function acceptPlan(ctx: ExtensionContext, from: PlanningPhase, plan: string): Promise<void> {
@@ -926,7 +926,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				return;
 			}
 			if (correction.trim()) {
-				pi.sendUserMessage(correction.trim());
+				setTimeout(() => pi.sendUserMessage(correction.trim()), 0);
 				return;
 			}
 			if (!state.lastPrompt) {
