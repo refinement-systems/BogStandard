@@ -49,7 +49,7 @@ async function main(): Promise<void> {
 	const client = new Client({ connectionString: cfg.databaseUrl });
 	await client.connect();
 	try {
-		const res = await client.query<{ id: string }>(ELIGIBLE_SQL);
+		const res = await client.query<{ id: string }>(ELIGIBLE_SQL, [cfg.staleLockTimeoutMinutes]);
 		const ids = res.rows.map((r) => Number(r.id));
 		const out = limit === undefined ? ids : ids.slice(0, limit);
 		for (const id of out) console.log(id);

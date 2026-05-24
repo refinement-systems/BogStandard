@@ -1,4 +1,4 @@
-/* 
+/*
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted.
  *
@@ -12,41 +12,47 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { IssueDetail, LockEntry } from "../agent/extensions/bogstandard/db.js";
-import { buildIssueDisplay, isLockStale } from "../agent/extensions/bogstandard/db.js";
+import type { IssueDetail } from "../agent/extensions/bogstandard/db.js";
+import { buildIssueDisplay, isPhaseStale } from "../agent/extensions/bogstandard/db.js";
 
 function issue(overrides: Partial<IssueDetail> = {}): IssueDetail {
-	return { id: 1, title: "Test Issue", status: "open", ...overrides };
-}
-
-function makeLock(claimedMsAgo: number): LockEntry {
 	return {
-		agent_id: "test-agent",
-		branch: null,
-		claimed_at: new Date(Date.now() - claimedMsAgo).toISOString(),
-		signed_by: "test-agent",
+		id: 1,
+		title: "Test Issue",
+		phase: "ready",
+		current_version_id: 1,
+		current_version_no: 1,
+		...overrides,
 	};
 }
 
-describe("isLockStale", () => {
+function isoMsAgo(ms: number): string {
+	return new Date(Date.now() - ms).toISOString();
+}
+
+describe("isPhaseStale", () => {
 	const SIXTY_MIN = 60;
 
-	it("fresh lock is not stale", () => {
-		expect(isLockStale(makeLock(60_000), SIXTY_MIN)).toBe(false);
+	it("fresh phase_started_at is not stale", () => {
+		expect(isPhaseStale(isoMsAgo(60_000), SIXTY_MIN)).toBe(false);
 	});
 
-	it("old lock is stale", () => {
-		expect(isLockStale(makeLock(90 * 60_000), SIXTY_MIN)).toBe(true);
+	it("old phase_started_at is stale", () => {
+		expect(isPhaseStale(isoMsAgo(90 * 60_000), SIXTY_MIN)).toBe(true);
 	});
 
 	it("exactly at boundary is not stale (strict >)", () => {
-		expect(isLockStale(makeLock(SIXTY_MIN * 60_000), SIXTY_MIN)).toBe(false);
-		expect(isLockStale(makeLock(SIXTY_MIN * 60_000 + 1), SIXTY_MIN)).toBe(true);
+		expect(isPhaseStale(isoMsAgo(SIXTY_MIN * 60_000), SIXTY_MIN)).toBe(false);
+		expect(isPhaseStale(isoMsAgo(SIXTY_MIN * 60_000 + 1), SIXTY_MIN)).toBe(true);
 	});
 
 	it("respects custom timeout", () => {
-		expect(isLockStale(makeLock(6 * 60_000), 5)).toBe(true);
-		expect(isLockStale(makeLock(4 * 60_000), 5)).toBe(false);
+		expect(isPhaseStale(isoMsAgo(6 * 60_000), 5)).toBe(true);
+		expect(isPhaseStale(isoMsAgo(4 * 60_000), 5)).toBe(false);
+	});
+
+	it("null timestamp is not stale (no owner)", () => {
+		expect(isPhaseStale(null, SIXTY_MIN)).toBe(false);
 	});
 });
 

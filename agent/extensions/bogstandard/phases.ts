@@ -1,4 +1,4 @@
-/* 
+/*
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted.
  *
@@ -14,275 +14,207 @@
 /**
  * Phase state for the /bs-task orchestrator.
  *
- * Persisted via `pi.appendEntry("bs-task-phase", BogstandardPhaseEntry)`.
- * On `session_start` the extension walks back through entries to find the
- * latest entry of this customType and rehydrates `BogstandardState`.
+ * The source of truth lives in postgres: `issues.phase`, `issues.current_agent_id`,
+ * and the `phase_events` audit log. `BogstandardState` is just the in-memory
+ * cache the orchestrator keeps across event handlers — `loadState` rebuilds
+ * it from the DB on session start, `transitionPhase` (in db.ts) is what
+ * actually persists transitions.
  *
- * Two paths share this state: the no-tests path (planning → reviewing-plan
- * → implementing) and the TDD path (planning-red → reviewing-red-plan →
- * implementing-red → planning-green → reviewing-green-plan →
- * implementing-green, with optional bail back to planning-red).
+ * Transient working data — the in-flight plan, the red diff, a captured
+ * bail reason — is reconstructed from the most recent phase_events row's
+ * metadata, so a session restart picks up exactly where we left off.
  */
 
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { IssueComment, IssueDetail } from "./db.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getPool, recentPhaseEvents, type Phase, type PhaseEvent } from "./db.js";
 
-export type Phase =
-	| "idle"
-	// No-tests path
-	| "planning"
-	| "reviewing-plan"
-	| "implementing"
-	// TDD red phase
-	| "planning-red"
-	| "reviewing-red-plan"
-	| "implementing-red"
-	// TDD green phase
-	| "planning-green"
-	| "reviewing-green-plan"
-	| "implementing-green"
-	| "done";
+export type { Phase } from "./db.js";
 
+/**
+ * In-memory snapshot of the orchestrator's current working state. Persistent
+ * fields (`issueId`, `phase`, `versionId`) come from the issues row;
+ * transient fields are populated from phase_events metadata on resume or
+ * by the orchestrator's own tool handlers during a live session.
+ */
 export interface BogstandardState {
-	phase: Phase;
-	issueId?: number;
-	/** The current pending plan (red, green, or no-tests, depending on phase). */
-	plan?: string;
+	/** undefined when the orchestrator is idle (no issue claimed). */
+	issueId: number | undefined;
+	phase: Phase | undefined;
+	versionId: number | undefined;
+	/** The current pending plan (set by `save_plan`, consumed by the next transition). */
+	plan: string | undefined;
 	/** Captured after the red commit; fed to the green planner & implementer. */
-	redDiff?: string;
-	/** Set by the bail_out tool during implementing-green. Triggers reset. */
-	bailReason?: string;
-	/** The prompt last sent to kickoffPhase; replayed when "Continue" is chosen after an interrupt. */
-	lastPrompt?: string;
-	/**
-	 * Short SHA of the red commit, set by reconstructState when recovering after a green-bail.
-	 * routeRecoveredState uses this to reset git to before the red commit before restarting the
-	 * red planner, cleaning up any commits written during the aborted TDD cycle.
-	 */
-	bailRedSha?: string;
+	redDiff: string | undefined;
+	/** Set by the `bail_out` tool during green-impl. */
+	bailReason: string | undefined;
+	/** Set by the `propose_redraft` tool during any planning phase. */
+	redraftDiagnosis: string | undefined;
+	/** Short SHA of the red commit, captured so resume can roll back on bail recovery. */
+	bailRedSha: string | undefined;
+	/** Last prompt handed to the agent; replayed verbatim on Continue after an interrupt. */
+	lastPrompt: string | undefined;
 }
 
-/**
- * Serialized blob written to `pi.appendEntry("bs-task-phase", ...)`.
- * Keep this shape stable across versions; future versions can grow optional
- * fields but should not remove or repurpose existing ones.
- */
-export interface BogstandardPhaseEntry {
+export const IDLE_STATE: BogstandardState = {
+	issueId: undefined,
+	phase: undefined,
+	versionId: undefined,
+	plan: undefined,
+	redDiff: undefined,
+	bailReason: undefined,
+	redraftDiagnosis: undefined,
+	bailRedSha: undefined,
+	lastPrompt: undefined,
+};
+
+export function isActive(state: BogstandardState): boolean {
+	return state.issueId !== undefined && state.phase !== undefined && state.phase !== "done" && state.phase !== "aborted";
+}
+
+export function isMidWorkPhase(phase: Phase | undefined): boolean {
+	if (!phase) return false;
+	return (
+		phase === "planning" ||
+		phase === "implementing" ||
+		phase === "red_planning" ||
+		phase === "red_impl" ||
+		phase === "green_planning" ||
+		phase === "green_impl"
+	);
+}
+
+interface OwnedIssueRow {
+	id: string;
 	phase: Phase;
-	issueId?: number;
-	plan?: string;
-	redDiff?: string;
-	bailReason?: string;
-	lastPrompt?: string;
-	bailRedSha?: string;
-}
-
-const ENTRY_TYPE = "bs-task-phase";
-
-interface CustomEntry extends SessionEntry {
-	type: "custom";
-	customType?: string;
-	data?: unknown;
-}
-
-function isOurEntry(entry: SessionEntry): entry is CustomEntry {
-	const e = entry as CustomEntry;
-	return e.type === "custom" && e.customType === ENTRY_TYPE;
+	current_version_id: string;
 }
 
 /**
- * Walk the session entries (latest first) to find the most recent state.
- * Returns `{ phase: "idle" }` if no entry exists yet.
+ * Find the issue currently claimed by `agentId`. Returns null when none.
+ * When multiple are claimed (shouldn't happen — one agent_id should never
+ * hold more than one), the most recently active wins.
  */
-export function loadState(ctx: ExtensionContext): BogstandardState {
-	const entries = ctx.sessionManager.getEntries();
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const entry = entries[i];
-		if (isOurEntry(entry)) {
-			const data = entry.data as BogstandardPhaseEntry | undefined;
-			if (data && typeof data.phase === "string") {
-				return {
-					phase: data.phase,
-					issueId: data.issueId,
-					plan: data.plan,
-					redDiff: data.redDiff,
-					bailReason: data.bailReason,
-					lastPrompt: data.lastPrompt,
-					bailRedSha: data.bailRedSha,
-				};
+async function findOwnedIssue(agentId: string): Promise<OwnedIssueRow | null> {
+	const res = await getPool().query<OwnedIssueRow>(
+		`SELECT id, phase, current_version_id
+		   FROM issues
+		  WHERE current_agent_id = $1
+		    AND phase NOT IN ('done', 'aborted', 'archived')
+		  ORDER BY phase_started_at DESC NULLS LAST, id DESC
+		  LIMIT 1`,
+		[agentId],
+	);
+	return res.rowCount === 0 ? null : res.rows[0];
+}
+
+/**
+ * Rebuild the in-memory state for an issue from the DB. Pulls phase from
+ * the issues row, then walks recent phase_events to recover transient
+ * working data (plan, red SHA, bail SHA) the orchestrator needs to resume.
+ */
+export async function loadStateForIssue(pi: ExtensionAPI, issueId: number): Promise<BogstandardState> {
+	const res = await getPool().query<{ phase: Phase; current_version_id: string }>(
+		`SELECT phase, current_version_id FROM issues WHERE id = $1`,
+		[issueId],
+	);
+	if (res.rowCount === 0) return { ...IDLE_STATE };
+
+	const row = res.rows[0];
+	const events = await recentPhaseEvents(pi, issueId, 20);
+	return reconstructFromEvents(row.phase, issueId, Number(row.current_version_id), events);
+}
+
+/**
+ * If our agent owns an active issue, build state for it. Otherwise idle.
+ */
+export async function loadState(pi: ExtensionAPI, agentId: string | null): Promise<BogstandardState> {
+	if (!agentId) return { ...IDLE_STATE };
+	const owned = await findOwnedIssue(agentId);
+	if (!owned) return { ...IDLE_STATE };
+	return loadStateForIssue(pi, Number(owned.id));
+}
+
+/**
+ * Pure helper: reconstruct transient state by replaying recent events in
+ * reverse-chronological order. Exposed for unit tests.
+ */
+export function reconstructFromEvents(
+	phase: Phase,
+	issueId: number,
+	versionId: number,
+	events: PhaseEvent[],
+): BogstandardState {
+	const state: BogstandardState = {
+		...IDLE_STATE,
+		issueId,
+		phase,
+		versionId,
+	};
+
+	// Walk newest → oldest. The first relevant event for each field wins.
+	// Events from recentPhaseEvents are already ordered DESC by id.
+	let foundPlan = false;
+	let foundRedSha = false;
+	let foundBailSha = false;
+
+	for (const ev of events) {
+		const md = ev.metadata ?? {};
+
+		// Plan accompanies a transition INTO an implementing phase.
+		if (!foundPlan && typeof md.plan === "string") {
+			if (
+				(phase === "implementing" && ev.phase_to === "implementing") ||
+				(phase === "red_impl" && ev.phase_to === "red_impl") ||
+				(phase === "green_impl" && ev.phase_to === "green_impl")
+			) {
+				state.plan = md.plan as string;
+				foundPlan = true;
 			}
 		}
-	}
-	return { phase: "idle" };
-}
 
-export function saveState(pi: ExtensionAPI, state: BogstandardState): void {
-	const entry: BogstandardPhaseEntry = {
-		phase: state.phase,
-		issueId: state.issueId,
-		plan: state.plan,
-		redDiff: state.redDiff,
-		bailReason: state.bailReason,
-		lastPrompt: state.lastPrompt,
-		bailRedSha: state.bailRedSha,
-	};
-	pi.appendEntry(ENTRY_TYPE, entry);
-}
+		// Red diff & sha: captured at transition into green_planning.
+		if (!foundRedSha && typeof md.red_sha === "string") {
+			if (typeof md.red_diff === "string") {
+				state.redDiff = md.red_diff as string;
+			}
+			foundRedSha = true;
+		}
 
-/**
- * Build the machine-parseable HTML comment header for a durable /bs-task event.
- * Format: `<!-- bs-task:v=1 event=<slug> [k=v ...] -->`
- */
-export function buildBsHeader(event: string, attrs: Record<string, string> = {}): string {
-	const pairs = [`event=${event}`, ...Object.entries(attrs).map(([k, v]) => `${k}=${v}`)].join(" ");
-	return `<!-- bs-task:v=1 ${pairs} -->`;
-}
-
-/**
- * Parse the first line of a comment body as a /bs-task event header.
- * Returns a map of all key=value pairs (including `event`) or null if the line
- * is not a /bs-task header.
- */
-export function parseBsHeader(line: string): Record<string, string> | null {
-	const match = line.match(/^<!-- bs-task:v=\d+ (.+?)-->$/);
-	if (!match) return null;
-	const attrs: Record<string, string> = {};
-	for (const token of match[1].trim().split(/\s+/)) {
-		const eq = token.indexOf("=");
-		if (eq > 0) attrs[token.slice(0, eq)] = token.slice(eq + 1);
-	}
-	return attrs["event"] ? attrs : null;
-}
-
-interface BsEventRecord {
-	event: string;
-	attrs: Record<string, string>;
-	body: string;
-}
-
-function extractBsEvents(comments: IssueComment[]): BsEventRecord[] {
-	const events: BsEventRecord[] = [];
-	for (const comment of comments) {
-		const lines = comment.content.split("\n");
-		const attrs = parseBsHeader(lines[0]);
-		if (!attrs) continue;
-		events.push({
-			event: attrs["event"],
-			attrs,
-			body: lines.slice(1).join("\n").trim(),
-		});
-	}
-	return events;
-}
-
-function findLast<T>(arr: T[], pred: (e: T) => boolean): T | undefined {
-	for (let i = arr.length - 1; i >= 0; i--) {
-		if (pred(arr[i])) return arr[i];
-	}
-	return undefined;
-}
-
-/**
- * Reconstruct BogStandard phase state from postgres comment history.
- *
- * Pure w.r.t. pi runtime — `gitShow` is injected so the function is
- * unit-testable without a real git process. Pass undefined to skip diff
- * reconstruction (tests that don't exercise the TDD path).
- *
- * Returns `{ phase: 'idle' }` when no BogStandard events are found.
- */
-export async function reconstructState(
-	issue: IssueDetail,
-	gitShow?: (sha: string) => Promise<string>,
-): Promise<BogstandardState> {
-	const events = extractBsEvents(issue.comments ?? []);
-	if (events.length === 0) return { phase: "idle" };
-
-	const hasClosed = events.some(
-		(e) => e.event === "closed" || e.event === "final-commit",
-	);
-	const hasGreenBail = events.some((e) => e.event === "green-bail");
-	const lastGreenPlan = findLast(
-		events,
-		(e) => e.event === "plan-accepted" && e.attrs["phase"] === "planning-green",
-	);
-	const lastRedCommit = findLast(events, (e) => e.event === "red-commit");
-	const lastRedPlan = findLast(
-		events,
-		(e) => e.event === "plan-accepted" && e.attrs["phase"] === "planning-red",
-	);
-	const lastNoPlan = findLast(
-		events,
-		(e) => e.event === "plan-accepted" && e.attrs["phase"] === "planning",
-	);
-	const pathChosen = findLast(events, (e) => e.event === "path-chosen");
-
-	async function getRedDiff(sha: string | undefined): Promise<string | undefined> {
-		if (!sha || !gitShow) return undefined;
-		try {
-			return await gitShow(sha);
-		} catch {
-			return "(unavailable — check `git log` for the red commit)";
+		// Bail SHA: when we just transitioned back to red_planning via bail,
+		// remember the red commit sha so resume can roll git back.
+		if (!foundBailSha && phase === "red_planning" && typeof md.bail_sha === "string") {
+			state.bailRedSha = md.bail_sha as string;
+			foundBailSha = true;
 		}
 	}
 
-	if (hasClosed) {
-		return { phase: "done", issueId: issue.id };
-	}
-	if (hasGreenBail) {
-		// Include the red commit SHA so routeRecoveredState can reset git to before it,
-		// cleaning up the red commit and any subsequent commits (e.g. WIP commit from
-		// "Not done, quitting") before restarting the red planner.
-		return { phase: "planning-red", issueId: issue.id, bailRedSha: lastRedCommit?.attrs["sha"] };
-	}
-	if (lastGreenPlan) {
-		const redDiff = await getRedDiff(lastRedCommit?.attrs["sha"]);
-		return {
-			phase: "implementing-green",
-			issueId: issue.id,
-			plan: lastGreenPlan.body || undefined,
-			redDiff,
-		};
-	}
-	if (lastRedCommit) {
-		const redDiff = await getRedDiff(lastRedCommit.attrs["sha"]);
-		return { phase: "planning-green", issueId: issue.id, redDiff };
-	}
-	if (lastRedPlan) {
-		return {
-			phase: "implementing-red",
-			issueId: issue.id,
-			plan: lastRedPlan.body || undefined,
-		};
-	}
-	if (lastNoPlan) {
-		return {
-			phase: "implementing",
-			issueId: issue.id,
-			plan: lastNoPlan.body || undefined,
-		};
-	}
-	if (pathChosen) {
-		const phase = pathChosen.attrs["path"] === "tdd" ? "planning-red" : "planning";
-		return { phase, issueId: issue.id };
-	}
-	return { phase: "idle" };
+	return state;
 }
 
 /**
- * Classify why an agent loop ended.
+ * Classify why an agent loop ended. Mirrors today's semantics but reads
+ * from BogstandardState instead of pi.appendEntry, since state is now
+ * DB-backed.
  *
- * "tool-terminate" — save_plan or bail_out ran (detectable from state side-effects).
- * "interrupted"    — user pressed Ctrl+C (stopReason "aborted" without tool side-effects).
- * "completed"      — natural finish (stopReason "stop") or any other reason.
+ *   tool-terminate — save_plan, bail_out, or propose_redraft ran
+ *   interrupted    — user pressed Ctrl+C (stopReason "aborted" with no tool side-effect)
+ *   completed      — natural finish or any other reason
  */
 export function endReason(
 	event: { messages: Array<{ role?: string; stopReason?: string }> },
 	state: BogstandardState,
 ): "completed" | "tool-terminate" | "interrupted" {
-	// save_plan transitions phase to reviewing-*; bail_out sets bailReason while staying in implementing-green
-	if (state.phase.startsWith("reviewing-")) return "tool-terminate";
-	if (state.phase === "implementing-green" && state.bailReason !== undefined) return "tool-terminate";
+	if (state.plan !== undefined && (state.phase === "planning" || state.phase === "red_planning" || state.phase === "green_planning")) {
+		// save_plan was called: the plan is staged and the orchestrator will
+		// open the plan-review UI on agent_end.
+		return "tool-terminate";
+	}
+	if (state.phase === "green_impl" && state.bailReason !== undefined) {
+		return "tool-terminate";
+	}
+	if (state.redraftDiagnosis !== undefined) {
+		return "tool-terminate";
+	}
 
 	const lastMsg = event.messages.at(-1);
 	if (lastMsg?.stopReason === "aborted") return "interrupted";

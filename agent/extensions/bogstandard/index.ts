@@ -1,4 +1,4 @@
-/* 
+/*
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted.
  *
@@ -14,31 +14,20 @@
 /**
  * BogStandard — plan & implement issues end-to-end from pi.
  *
- * Two paths share one command and one state machine:
+ * The orchestrator drives one issue at a time through a DB-backed phase
+ * machine. needs_tests on the current issue version decides which path to
+ * take:
  *
- *   /bs-task [issue]
- *     -> pick issue + review-and-comment loop
- *     -> "Does this issue need tests?"
- *          -> no  : no-tests path
- *                   planning -> reviewing-plan -> implementing -> done
- *          -> yes : TDD path (requires a clean working tree)
- *                   planning-red -> reviewing-red-plan -> implementing-red
- *                   -> commit "Testing phase: red", capture diff
- *                   -> planning-green -> reviewing-green-plan
- *                   -> implementing-green
- *                       -> success: close + commit
- *                       -> bail   : comment + git reset --hard HEAD~1
- *                                   -> restart at planning-red
+ *   needs_tests = false  →  planning → implementing → done
+ *   needs_tests = true   →  red_planning → red_impl → green_planning
+ *                           → green_impl → done
+ *                          (with green-impl bail looping back to red_planning)
  *
- * Planning phases emit their plan via the `save_plan` tool (terminate: true).
- * Green-phase implementation can call `bail_out` to abort the cycle.
+ * State is persisted in postgres (issues.phase + phase_events). The
+ * in-memory `state` here is just the orchestrator's working cache; it is
+ * rebuilt from the DB on session_start by phases.loadState.
  *
- * Phase state is persisted via `pi.appendEntry("bs-task-phase", ...)` so
- * `pi -r` resumes from where we left off.
- *
- * The Designer stage (`/bs-design`) lives in `./designer.ts`; it runs as a
- * separate, conversational command and does not participate in this state
- * machine.
+ * The Designer stage (`/bs-design`) lives in ./designer.ts.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -47,22 +36,25 @@ import {
 	buildIssueDisplay,
 	configureDb,
 	getAgentId,
-	isLockStale,
-	type IssueDetail,
-	type IssueListEntry,
-	type LockEntry,
-	issueClose,
+	getOwnership,
+	getStaleTimeoutMinutes,
+	claimIssue,
+	releaseIssue,
+	stealIssue,
+	transitionPhase,
+	appendPhaseEvent,
+	recentPhaseEvents,
+	isPhaseStale,
 	issueComment,
 	issueShowJson,
-	locksClaim,
-	locksList,
-	locksRelease,
-	locksSteal,
+	type IssueDetail,
+	type IssueListEntry,
+	type Phase,
 } from "./db.js";
 import { loadConfig } from "./config.js";
-import { addAll, commit, currentBranch, hasStagedChanges, headShortSha, isClean, resetHardHeadMinus1, resetHardToRef, showHeadDiff } from "./git.js";
+import { addAll, commit, hasStagedChanges, headShortSha, isClean, resetHardHeadMinus1, resetHardToRef, showHeadDiff, statusShort } from "./git.js";
 import { formatIssueLabel, listEligible, pickFirstEligible } from "./issue-picker.js";
-import { type BogstandardState, type Phase, buildBsHeader, endReason, loadState, parseBsHeader, reconstructState, saveState } from "./phases.js";
+import { IDLE_STATE, isMidWorkPhase, loadState, loadStateForIssue, endReason, type BogstandardState } from "./phases.js";
 import {
 	buildGreenImplementPrompt,
 	buildGreenImplementerSystemPrompt,
@@ -78,49 +70,42 @@ import { registerQuestionnaireTool } from "./questionnaire.js";
 import { registerDesigner } from "./designer.js";
 import { showScrollableMarkdown } from "./scrollable-markdown.js";
 
-const PLAN_TOOLS = ["read", "grep", "find", "ls", "bash", "questionnaire", "save_plan"];
+const PLAN_TOOLS = ["read", "grep", "find", "ls", "bash", "questionnaire", "save_plan", "propose_redraft"];
 const IMPL_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"];
 const GREEN_IMPL_TOOLS = [...IMPL_TOOLS, "bail_out"];
 
-/**
- * Map a planning phase to its corresponding "plan review" phase.
- * `save_plan` calls this so the same tool transitions correctly whether the
- * caller is the no-tests, red, or green planner.
- */
-function planningToReviewPhase(phase: Phase): Phase {
-	if (phase === "planning") return "reviewing-plan";
-	if (phase === "planning-red") return "reviewing-red-plan";
-	if (phase === "planning-green") return "reviewing-green-plan";
-	// Defensive: save_plan was called outside a planning phase. Leave state
-	// untouched so the operator can investigate via /tree or pi -r.
-	return phase;
+type PlanningPhase = "planning" | "red_planning" | "green_planning";
+type ImplementingPhase = "implementing" | "red_impl" | "green_impl";
+
+function isPlanningPhase(phase: Phase | undefined): phase is PlanningPhase {
+	return phase === "planning" || phase === "red_planning" || phase === "green_planning";
+}
+
+function isImplementingPhase(phase: Phase | undefined): phase is ImplementingPhase {
+	return phase === "implementing" || phase === "red_impl" || phase === "green_impl";
+}
+
+/** planning → implementing, red_planning → red_impl, green_planning → green_impl */
+function implementingFor(planning: PlanningPhase): ImplementingPhase {
+	switch (planning) {
+		case "planning":       return "implementing";
+		case "red_planning":   return "red_impl";
+		case "green_planning": return "green_impl";
+	}
 }
 
 export default function bogstandard(pi: ExtensionAPI) {
-	let state: BogstandardState = { phase: "idle" };
-	// Working copy of the picked issue; re-fetched on session restore.
+	let state: BogstandardState = { ...IDLE_STATE };
 	let issue: IssueDetail | undefined;
-
-	function persist(): void {
-		saveState(pi, state);
-	}
-
-	function reset(): void {
-		state = { phase: "idle" };
-		issue = undefined;
-		persist();
-	}
 
 	registerQuestionnaireTool(pi);
 
 	registerDesigner(pi, {
-		isTaskActive: () => state.phase !== "idle" && state.phase !== "done",
+		isTaskActive: () => state.issueId !== undefined && isMidWorkPhase(state.phase),
 	});
 
-	// Per-phase model selection flags. The broad ones apply to every planner
-	// or implementer phase; the per-sub-phase overrides take precedence when
-	// set. All values take pi's standard `provider/id` form, e.g.
-	// `anthropic/claude-sonnet-4-6`.
+	// ── Flags ─────────────────────────────────────────────────────────────────
+
 	pi.registerFlag("bs-plan-model", {
 		description: "Model for all planner phases (provider/id). Overridden by per-sub-phase flags.",
 		type: "string",
@@ -147,7 +132,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 	});
 	pi.registerFlag("bs-issue-id", {
 		description:
-			"Issue ID to work on (set by dispatch.sh to pre-assign workers; skips auto-pick). For interactive use, type '/bs-task <id>' in the prompt instead.",
+			"Issue ID to work on (set by dispatch.sh to pre-assign workers). For interactive use, type '/bs-task <id>' in the prompt instead.",
 		type: "string",
 	});
 	pi.registerFlag("bs-database-url", {
@@ -157,17 +142,15 @@ export default function bogstandard(pi: ExtensionAPI) {
 	});
 	pi.registerFlag("bs-agent-id", {
 		description:
-			"Agent id used for lock ownership (overrides BOGSTANDARD_AGENT_ID and .bogstandard/config.json). Distinct ids let multiple workers hold distinct locks against the same database.",
+			"Agent id used for issue ownership (overrides BOGSTANDARD_AGENT_ID and .bogstandard/config.json). Distinct ids let multiple workers hold distinct claims against the same database.",
 		type: "string",
-	});
-	pi.registerFlag("bs-recover", {
-		description: "Force recovery from postgres comment history, even if local state exists.",
-		type: "boolean",
 	});
 	pi.registerFlag("bs-debug", {
 		description: "Print the system prompt and user prompt before each agent phase starts.",
 		type: "boolean",
 	});
+
+	// ── Tools ─────────────────────────────────────────────────────────────────
 
 	pi.registerTool({
 		name: "save_plan",
@@ -179,15 +162,8 @@ export default function bogstandard(pi: ExtensionAPI) {
 		}),
 		async execute(_id, params) {
 			state.plan = params.plan;
-			state.phase = planningToReviewPhase(state.phase);
-			persist();
 			return {
-				content: [
-					{
-						type: "text",
-						text: "Plan saved. Stop now — do not call any more tools.",
-					},
-				],
+				content: [{ type: "text", text: "Plan saved. Stop now — do not call any more tools." }],
 				terminate: true,
 			};
 		},
@@ -205,18 +181,6 @@ export default function bogstandard(pi: ExtensionAPI) {
 		}),
 		async execute(_id, params) {
 			state.bailReason = params.reason;
-			persist();
-			// Write green-bail to postgres immediately so reconstructState can detect
-			// the bail even if the session ends before handleBail runs (e.g. crash,
-			// or the user choosing "Not done, quitting" and resetting state to idle).
-			if (issue) {
-				try {
-					const header = buildBsHeader("green-bail");
-					await issueComment(pi, issue.id, "blocker", `${header}\n\n${params.reason}`);
-				} catch {
-					// non-fatal: handleBail will post again if this fails
-				}
-			}
 			return {
 				content: [
 					{
@@ -229,61 +193,110 @@ export default function bogstandard(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "propose_redraft",
+		label: "Propose Redraft",
+		description:
+			"Call this when you believe the issue itself is wrong, contradicts the codebase, or cannot be sensibly planned as written. Supply a precise diagnosis. The user will choose: continue planning, discuss with you, or bail back to the Designer for a redraft. Only available during planning phases.",
+		parameters: Type.Object({
+			diagnosis: Type.String({
+				description: "What is wrong with the issue and why it cannot be planned as written",
+			}),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (!ctx.hasUI) {
+				return {
+					content: [{ type: "text", text: "Error: UI not available (running in non-interactive mode)." }],
+				};
+			}
+			const choice = await ctx.ui.select(
+				`Planner disagrees with the design:\n\n${params.diagnosis}\n\nWhat next?`,
+				[
+					"Continue planning anyway",
+					"Discuss with the planner",
+					"Bail and redraft via Designer",
+				],
+			);
+			if (!choice || choice.startsWith("Continue")) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "The user has overruled your concern. Continue planning. Lock the relevant assumption in your plan's Resolved Questions section if it materially affects scope.",
+						},
+					],
+				};
+			}
+			if (choice.startsWith("Discuss")) {
+				const reply = await ctx.ui.editor("Your response to the planner:", "");
+				const text = reply?.trim() ? reply.trim() : "(user provided no additional context)";
+				return {
+					content: [{ type: "text", text: `User response:\n\n${text}` }],
+				};
+			}
+			// Bail
+			state.redraftDiagnosis = params.diagnosis;
+			return {
+				content: [
+					{
+						type: "text",
+						text: "The user agrees the issue needs redrafting. Stop now — do not call any more tools. Send a final message summarizing your diagnosis and end.",
+					},
+				],
+				terminate: true,
+			};
+		},
+	});
+
+	// ── Phase system prompts ──────────────────────────────────────────────────
+
 	pi.on("before_agent_start", async (event) => {
 		const phase = state.phase;
+		if (phase === undefined) return undefined;
 		if (
 			phase === "planning" ||
-			phase === "planning-red" ||
-			phase === "planning-green" ||
+			phase === "red_planning" ||
+			phase === "green_planning" ||
 			phase === "implementing" ||
-			phase === "implementing-red" ||
-			phase === "implementing-green"
+			phase === "red_impl" ||
+			phase === "green_impl"
 		) {
 			return { systemPrompt: buildPhaseSystemPrompt(phase, event.systemPrompt) };
 		}
 		return undefined;
 	});
 
+	// ── /bs-task command ──────────────────────────────────────────────────────
+
 	pi.registerCommand("bs-task", {
 		description: "Plan & implement the next eligible issue (or the one whose id you pass)",
 		getArgumentCompletions: async (prefix) => {
 			try {
-				const eligible = await listEligible(pi);
+				const stale = getStaleTimeoutMinutes();
+				const eligible = await listEligible(pi, stale);
 				const matching = eligible.filter((i) => String(i.id).startsWith(prefix));
 				if (matching.length === 0) return null;
-				return matching.map((i) => ({
-					value: String(i.id),
-					label: formatIssueLabel(i),
-				}));
+				return matching.map((i) => ({ value: String(i.id), label: formatIssueLabel(i) }));
 			} catch {
 				return null;
 			}
 		},
 		handler: async (args, ctx) => {
-			if (state.phase !== "idle" && state.phase !== "done") {
-				if (state.phase === "implementing" || state.phase === "implementing-red") {
-					await handleImplementationEnd(ctx, false);
-					return;
-				}
-				if (state.phase === "implementing-green") {
-					if (state.bailReason !== undefined) {
-						await handleBail(ctx);
-					} else {
-						await handleImplementationEnd(ctx, false);
+			// Mid-work resume: reconcile
+			if (state.issueId !== undefined && isMidWorkPhase(state.phase)) {
+				if (!issue) {
+					try {
+						issue = await issueShowJson(pi, state.issueId);
+					} catch (err) {
+						ctx.ui.notify(`Failed to fetch issue #${state.issueId}: ${err}`, "error");
+						return;
 					}
-					return;
 				}
-				ctx.ui.notify(
-					`/bs-task is already running (phase: ${state.phase}). Resolve or /new to start over.`,
-					"warning",
-				);
+				await reconcileResume(ctx);
 				return;
 			}
 
-			// Resolve which issue to work on.
-			// --bs-issue-id takes precedence over the positional arg; dispatch.sh
-			// uses it because pi's CLI parser treats positional tokens after the
-			// command name as separate messages, not as command args.
+			// New pick
 			let picked: IssueListEntry | undefined;
 			const flagIssueId = pi.getFlag("bs-issue-id") as string | undefined;
 			const arg = flagIssueId ?? args.trim();
@@ -293,16 +306,16 @@ export default function bogstandard(pi: ExtensionAPI) {
 					ctx.ui.notify(`Invalid issue id: ${arg}`, "error");
 					return;
 				}
-				picked = { id, title: "", status: "open" };
+				picked = { id, title: "", phase: "ready" };
 			} else {
 				try {
-					picked = await pickFirstEligible(pi);
+					picked = await pickFirstEligible(pi, getStaleTimeoutMinutes());
 				} catch (err) {
 					ctx.ui.notify(`Failed to query issues: ${err}`, "error");
 					return;
 				}
 				if (!picked) {
-					ctx.ui.notify("No eligible open issues found.", "warning");
+					ctx.ui.notify("No eligible issues found. Run /bs-design to draft or classify some.", "warning");
 					return;
 				}
 			}
@@ -314,78 +327,55 @@ export default function bogstandard(pi: ExtensionAPI) {
 				return;
 			}
 
-			const bsRecover = pi.getFlag("bs-recover") as boolean | undefined;
-			if (bsRecover || (state.phase === "idle" && hasBsEvents(issue))) {
-				const doRecover =
-					bsRecover ||
-					(await ctx.ui.confirm(
-						`Found an in-flight BogStandard run on issue #${issue.id} — recover from comment history?`,
-						"State will be rebuilt from the issue's comment log. The working tree is left as-is.",
-					));
-				if (doRecover) {
-					const gitShowFn = async (sha: string): Promise<string> => {
-						const result = await pi.exec("git", ["show", sha, "--stat", "--patch", "--no-color"]);
-						return result.stdout;
-					};
-					state = await reconstructState(issue, gitShowFn);
-					persist();
-					// Claim the lock during recovery if we don't already hold it.
-					const recoveryAgentId = await getAgentId(pi);
-					if (recoveryAgentId) {
-						const lf = await locksList(pi);
-						const hasOurLock = lf?.locks[String(issue.id)]?.agent_id === recoveryAgentId;
-						if (!hasOurLock) {
-							try {
-								await locksClaim(pi, issue.id, await currentBranch(pi));
-							} catch (err) {
-								ctx.ui.notify(`Recovery: could not claim lock: ${err}`, "warning");
-							}
-						}
-					}
-					await routeRecoveredState(ctx);
-					return;
-				}
-			}
-
-			// Check for a foreign lock before the review loop.
-			const lockResult = await checkAndHandleLock(ctx, issue.id);
-			if (lockResult === "abort") return;
-
-			const confirmed = await runIssueReviewLoop(pi, ctx);
-			if (!confirmed || !issue) {
+			// If the picked issue is mid-work, run reconciliation.
+			if (isMidWorkPhase(issue.phase)) {
+				state = await loadStateForIssue(pi, issue.id);
+				await reconcileResume(ctx);
 				return;
 			}
 
-			// Claim the lock now that the user has confirmed this issue.
-			const claimAgentId = await getAgentId(pi);
-			if (claimAgentId) {
-				try {
-					await locksClaim(pi, issue.id, await currentBranch(pi));
-				} catch (err) {
-					ctx.ui.notify(`Could not claim lock on issue #${issue.id}: ${err}`, "error");
-					return;
-				}
+			if (issue.phase !== "ready") {
+				ctx.ui.notify(
+					`Issue #${issue.id} is in phase '${issue.phase}' — only 'ready' issues can be started. Run /bs-design to redraft or unarchive.`,
+					"error",
+				);
+				return;
 			}
 
-			// Choose between TDD and direct-implementation paths.
-			const needsTests = await ctx.ui.confirm(
-				"Choose an implementation path",
-				"Red-Green TDD: write failing tests first, commit, then make them pass. Implement directly: single plan + implementation, agent follows the issue as written.",
-			);
+			if (issue.needs_tests === null || issue.needs_tests === undefined) {
+				ctx.ui.notify(
+					`Issue #${issue.id} is missing needs_tests classification. Run /bs-design to set it before /bs-task.`,
+					"error",
+				);
+				return;
+			}
 
-			await postDurableComment(
-				ctx,
-				"decision",
-				"path-chosen",
-				{ path: needsTests ? "tdd" : "no-tests" },
-				needsTests ? "Path chosen: TDD (red/green cycle)" : "Path chosen: implement directly (single plan + implement)",
-			);
+			// Check + handle foreign ownership.
+			const lockOk = await checkAndHandleOwnership(ctx, issue.id);
+			if (lockOk === "abort") return;
 
-			if (needsTests) {
+			// Issue review.
+			const confirmed = await runIssueReviewLoop(ctx);
+			if (!confirmed || !issue) return;
+
+			const myAgentId = await getAgentId(pi);
+			if (!myAgentId) {
+				ctx.ui.notify("/bs-task: no agent id configured. Cannot claim issue.", "error");
+				return;
+			}
+
+			const claimed = await claimIssue(pi, issue.id, myAgentId, getStaleTimeoutMinutes());
+			if (!claimed) {
+				ctx.ui.notify(`Could not claim issue #${issue.id}: another agent holds the claim.`, "error");
+				return;
+			}
+
+			const targetPhase: PlanningPhase = issue.needs_tests ? "red_planning" : "planning";
+
+			if (targetPhase === "red_planning") {
 				try {
-					const clean = await isClean(pi);
-					if (!clean) {
-						await locksRelease(pi, issue.id);
+					if (!(await isClean(pi))) {
+						await releaseIssue(pi, issue.id, myAgentId);
 						ctx.ui.notify(
 							"TDD path requires a clean working tree. Stash or commit your changes, then re-run /bs-task.",
 							"error",
@@ -396,108 +386,82 @@ export default function bogstandard(pi: ExtensionAPI) {
 					ctx.ui.notify(`Failed to check git status: ${err}`, "error");
 					return;
 				}
+			}
 
-				state = { phase: "planning-red", issueId: issue.id };
-				persist();
-				await kickoffPhase(
-					ctx,
-					"planning-red",
-					"bs-task-red-plan-prompt",
-					buildRedPlanPrompt(issue),
-					PLAN_TOOLS,
-				);
+			try {
+				await transitionPhase(pi, {
+					issueId: issue.id,
+					from: "ready",
+					to: targetPhase,
+					agentId: myAgentId,
+					reason: targetPhase === "red_planning" ? "starting TDD path" : "starting direct-impl path",
+				});
+			} catch (err) {
+				ctx.ui.notify(`Could not start phase '${targetPhase}': ${err}`, "error");
+				await releaseIssue(pi, issue.id, myAgentId);
 				return;
 			}
 
-			// Implement directly path.
-			state = { phase: "planning", issueId: issue.id };
-			persist();
+			state = {
+				...IDLE_STATE,
+				issueId: issue.id,
+				phase: targetPhase,
+				versionId: issue.current_version_id,
+			};
+
 			await kickoffPhase(
 				ctx,
-				"planning",
-				"bs-task-plan-prompt",
-				buildPlanPrompt(issue),
+				targetPhase,
+				customTypeForPhase(targetPhase),
+				targetPhase === "red_planning" ? buildRedPlanPrompt(issue) : buildPlanPrompt(issue),
 				PLAN_TOOLS,
 			);
 		},
 	});
 
-	/**
-	 * Shown when another agent holds the lock on the picked issue.
-	 * Returns the operator's decision.
-	 */
-	async function handleForeignLock(
-		ctx: ExtensionContext,
-		issueId: number,
-		lock: LockEntry,
-		stale: boolean,
-	): Promise<"steal" | "pick-other" | "abort"> {
-		const ageMin = Math.round((Date.now() - new Date(lock.claimed_at).getTime()) / 60000);
+	// ── Ownership: foreign-lock handling ──────────────────────────────────────
+
+	async function checkAndHandleOwnership(ctx: ExtensionContext, issueId: number): Promise<"ok" | "abort"> {
+		const myAgentId = await getAgentId(pi);
+		if (!myAgentId) return "ok";
+		const own = await getOwnership(pi, issueId);
+		if (!own) return "ok";
+		if (own.current_agent_id === null || own.current_agent_id === myAgentId) return "ok";
+		const stale = isPhaseStale(own.phase_started_at, getStaleTimeoutMinutes());
+		const ageMin = own.phase_started_at
+			? Math.round((Date.now() - new Date(own.phase_started_at).getTime()) / 60000)
+			: 0;
 		const staleTag = stale ? " [STALE]" : "";
 		ctx.ui.notify(
-			`Issue #${issueId} is locked by '${lock.agent_id}' (${ageMin} min ago)${staleTag}`,
+			`Issue #${issueId} is claimed by '${own.current_agent_id}' (${ageMin} min ago)${staleTag}`,
 			"warning",
 		);
 		const choice = await ctx.ui.select("How would you like to proceed?", [
 			"Pick a different issue",
-			"Steal the lock",
+			"Steal the claim",
 			"Abort",
 		]);
-		if (!choice || choice === "Abort") return "abort";
-		if (choice.startsWith("Steal")) return "steal";
-		return "pick-other";
-	}
-
-	/**
-	 * Check for a foreign lock on the issue and let the operator decide how
-	 * to handle it. Call this after the issue is fetched, before the review
-	 * loop. Returns "ok" to continue or "abort" to exit the command.
-	 *
-	 * Gracefully degrades: if agent is not configured or the coordination
-	 * branch is unreachable, returns "ok" and proceeds without lock management.
-	 */
-	async function checkAndHandleLock(
-		ctx: ExtensionContext,
-		issueId: number,
-	): Promise<"ok" | "abort"> {
-		const myAgentId = await getAgentId(pi);
-		if (!myAgentId) return "ok"; // locks not configured — skip
-
-		const locksFile = await locksList(pi);
-		if (!locksFile) return "ok"; // coordination branch unreachable — skip
-
-		const lockEntry = locksFile.locks[String(issueId)];
-		if (!lockEntry) return "ok"; // not locked
-		if (lockEntry.agent_id === myAgentId) return "ok"; // our lock — proceed
-
-		const stale = isLockStale(lockEntry, locksFile.settings.stale_lock_timeout_minutes);
-		const decision = await handleForeignLock(ctx, issueId, lockEntry, stale);
-
-		if (decision === "abort") {
+		if (!choice || choice === "Abort") {
 			ctx.ui.notify("Aborted.", "info");
 			return "abort";
 		}
-		if (decision === "pick-other") {
-			ctx.ui.notify("Re-run /bs-task to pick a different issue.", "info");
-			return "abort";
+		if (choice.startsWith("Steal")) {
+			try {
+				await stealIssue(pi, issueId, myAgentId);
+				ctx.ui.notify(`Stole claim on issue #${issueId}.`, "info");
+				return "ok";
+			} catch (err) {
+				ctx.ui.notify(`Failed to steal claim: ${err}`, "error");
+				return "abort";
+			}
 		}
-		// Steal
-		try {
-			await locksSteal(pi, issueId);
-			ctx.ui.notify(`Stole lock on issue #${issueId}.`, "info");
-			return "ok";
-		} catch (err) {
-			ctx.ui.notify(`Failed to steal lock: ${err}`, "error");
-			return "abort";
-		}
+		ctx.ui.notify("Re-run /bs-task to pick a different issue.", "info");
+		return "abort";
 	}
 
-	/**
-	 * Issue review / comment / swap loop. Runs until the user confirms,
-	 * aborts, or fails to pick something. Mutates the outer `issue` variable
-	 * as the user comments or swaps issues.
-	 */
-	async function runIssueReviewLoop(_pi: ExtensionAPI, ctx: ExtensionContext): Promise<boolean> {
+	// ── Issue review loop (pre-claim) ─────────────────────────────────────────
+
+	async function runIssueReviewLoop(ctx: ExtensionContext): Promise<boolean> {
 		while (issue) {
 			const action = await showScrollableMarkdown<"continue" | "comment" | "show" | "abort">(ctx, {
 				title: `Issue #${issue.id} — ${formatIssueLabel(issue)}`,
@@ -511,11 +475,9 @@ export default function bogstandard(pi: ExtensionAPI) {
 			});
 
 			if (action === "abort") {
-				if (issue) await locksRelease(pi, issue.id);
 				ctx.ui.notify("Aborted before planning.", "info");
 				return false;
 			}
-
 			if (action === "comment") {
 				const body = await ctx.ui.editor("Comment:", "");
 				if (body !== undefined && body.trim() !== "") {
@@ -528,17 +490,16 @@ export default function bogstandard(pi: ExtensionAPI) {
 				}
 				continue;
 			}
-
 			if (action === "show") {
 				let eligible: IssueListEntry[];
 				try {
-					eligible = await listEligible(pi);
+					eligible = await listEligible(pi, getStaleTimeoutMinutes());
 				} catch (err) {
 					ctx.ui.notify(`Failed to query issues: ${err}`, "error");
 					continue;
 				}
 				if (eligible.length === 0) {
-					ctx.ui.notify("No other eligible open issues.", "info");
+					ctx.ui.notify("No other eligible issues.", "info");
 					continue;
 				}
 				const labels = eligible.map((i) => formatIssueLabel(i));
@@ -555,66 +516,215 @@ export default function bogstandard(pi: ExtensionAPI) {
 				}
 				continue;
 			}
-
-			// action === "continue"
 			return true;
 		}
 		return false;
 	}
 
-	pi.on("agent_end", async (event, ctx) => {
-		if (!issue) return;
+	// ── Reconciliation on resume ──────────────────────────────────────────────
 
+	async function reconcileResume(ctx: ExtensionContext): Promise<void> {
+		if (!issue) return;
+		const events = await recentPhaseEvents(pi, issue.id, 5);
+		const lastEvent = events[0];
+		const treeStatus = await safeGitStatus();
+		const lines: string[] = [];
+		lines.push(`**Phase:** ${state.phase}`);
+		lines.push(`**Version:** v${issue.current_version_no}`);
+		lines.push(`**needs_tests:** ${issue.needs_tests === null || issue.needs_tests === undefined ? "(unset)" : String(issue.needs_tests)}`);
+		if (lastEvent) {
+			lines.push(
+				`**Last event:** ${lastEvent.phase_from ?? "(none)"} → ${lastEvent.phase_to}${lastEvent.reason ? ` — ${lastEvent.reason}` : ""}`,
+			);
+		}
+		lines.push(`**Working tree:** ${treeStatus}`);
+		lines.push("");
+		lines.push("---");
+		lines.push("");
+		lines.push(buildIssueDisplay(issue));
+
+		const action = await showScrollableMarkdown<"continue" | "abandon" | "redraft">(ctx, {
+			title: `Resume issue #${issue.id} — ${issue.title}`,
+			markdown: lines.join("\n"),
+			actions: [
+				{ keyId: "return", label: "↵ continue", result: "continue" },
+				{ keyId: "a", label: "a abandon", result: "abandon" },
+				{ keyId: "escape", label: "esc explain to Designer", result: "redraft" },
+			],
+		});
+
+		if (action === "continue") {
+			await routeContinueResume(ctx);
+			return;
+		}
+
+		const myAgentId = await getAgentId(pi);
+		if (action === "abandon") {
+			await abortIssue(ctx, "user abandoned during resume", myAgentId);
+			return;
+		}
+		// redraft path: ask for an explanation
+		const reason = await ctx.ui.editor(
+			"Explain what's wrong so the Designer can redraft. Leave blank to abandon without a reason:",
+			"",
+		);
+		const reasonText = reason && reason.trim() ? reason.trim() : "(no reason provided)";
+		await abortIssue(ctx, reasonText, myAgentId);
+		ctx.ui.notify(
+			`Issue #${issue.id} marked 'aborted'. Run /bs-design to redraft it.`,
+			"info",
+		);
+	}
+
+	async function safeGitStatus(): Promise<string> {
+		try {
+			const clean = await isClean(pi);
+			if (clean) return "clean";
+			const summary = (await statusShort(pi)).trim().split("\n").filter((l) => l).length;
+			return `dirty (${summary} file${summary === 1 ? "" : "s"})`;
+		} catch {
+			return "(could not read git status)";
+		}
+	}
+
+	async function abortIssue(ctx: ExtensionContext, reason: string, agentId: string | null): Promise<void> {
+		if (!issue || !state.phase) return;
+		try {
+			await transitionPhase(pi, {
+				issueId: issue.id,
+				from: state.phase,
+				to: "aborted",
+				agentId,
+				reason,
+			});
+		} catch (err) {
+			ctx.ui.notify(`Could not transition to aborted: ${err}`, "error");
+			return;
+		}
+		if (agentId) await releaseIssue(pi, issue.id, agentId);
+		ctx.ui.notify(`Issue #${issue.id} aborted.`, "info");
+		state = { ...IDLE_STATE };
+		issue = undefined;
+	}
+
+	async function routeContinueResume(ctx: ExtensionContext): Promise<void> {
+		if (!issue || !state.phase) return;
+		const phase = state.phase;
+		switch (phase) {
+			case "planning":
+				await kickoffPhase(ctx, "planning", customTypeForPhase("planning"), buildPlanPrompt(issue), PLAN_TOOLS);
+				return;
+			case "implementing":
+				await handleImplementationEnd(ctx, false);
+				return;
+			case "red_planning": {
+				if (state.bailRedSha) {
+					ctx.ui.notify(
+						`Resetting git to before the red commit (${state.bailRedSha}) to clean up the aborted TDD cycle.`,
+						"info",
+					);
+					try {
+						await resetHardToRef(pi, `${state.bailRedSha}~1`);
+					} catch (err) {
+						ctx.ui.notify(
+							`Could not auto-reset to ${state.bailRedSha}~1: ${err}. Reset manually before continuing.`,
+							"warning",
+						);
+					}
+					state.bailRedSha = undefined;
+				}
+				await kickoffPhase(ctx, "red_planning", customTypeForPhase("red_planning"), buildRedPlanPrompt(issue), PLAN_TOOLS);
+				return;
+			}
+			case "red_impl":
+				await handleImplementationEnd(ctx, false);
+				return;
+			case "green_planning": {
+				const diff = state.redDiff ?? "(unavailable — check `git log` for the red commit)";
+				await kickoffPhase(
+					ctx,
+					"green_planning",
+					customTypeForPhase("green_planning"),
+					buildGreenPlanPrompt(issue, diff),
+					PLAN_TOOLS,
+				);
+				return;
+			}
+			case "green_impl":
+				await handleImplementationEnd(ctx, false);
+				return;
+			default:
+				ctx.ui.notify(`Recovered to phase '${phase}' — nothing to do.`, "warning");
+		}
+	}
+
+	// ── agent_end dispatcher ──────────────────────────────────────────────────
+
+	pi.on("agent_end", async (event, ctx) => {
+		if (!issue || state.issueId === undefined) return;
 		try {
 			const reason = endReason(event, state);
+
+			if (state.redraftDiagnosis !== undefined) {
+				await handleProposeRedraft(ctx);
+				return;
+			}
+
 			if (reason === "interrupted") {
 				await handleInterrupt(ctx);
 				return;
 			}
-			switch (state.phase) {
-				case "reviewing-plan":
-					if (state.plan) await handleNoTestsPlanReview(ctx);
-					return;
-				case "implementing":
-				case "implementing-red":
+
+			if (isPlanningPhase(state.phase) && state.plan) {
+				await handlePlanReview(ctx);
+				return;
+			}
+
+			if (isImplementingPhase(state.phase)) {
+				if (state.phase === "green_impl" && state.bailReason !== undefined) {
+					await handleBail(ctx);
+				} else {
 					await handleImplementationEnd(ctx, false);
-					return;
-				case "implementing-green":
-					// bail_out sets bailReason — skip the "Implementation complete" menu
-					// and go straight to bail handling so the user isn't offered "close and commit".
-					if (state.bailReason !== undefined) {
-						await handleBail(ctx);
-					} else {
-						await handleImplementationEnd(ctx, false);
-					}
-					return;
-				case "reviewing-red-plan":
-					if (state.plan) await handleRedPlanReview(ctx);
-					return;
-				case "reviewing-green-plan":
-					if (state.plan) await handleGreenPlanReview(ctx);
-					return;
+				}
+				return;
 			}
 		} catch (err) {
-			// Surface unexpected failures rather than silently leaving the state
-			// machine stuck; user can then re-invoke /bs-task or pi -r.
 			ctx.ui.notify(`/bs-task: ${err}`, "error");
 		}
 	});
 
-	/**
-	 * Shared plan-review UI. Renders the current `state.plan` as scrollable
-	 * markdown; Enter accepts (handing off to `onAccept`), Escape drops to
-	 * a small refine/abort select.
-	 */
-	async function reviewPlanUI(
-		ctx: ExtensionContext,
-		options: {
-			refinePhase: Phase;
-			onAccept: (acceptedPlan: string) => Promise<void>;
-		},
-	): Promise<void> {
-		if (!issue || !state.plan) return;
+	// ── propose_redraft handler ───────────────────────────────────────────────
+
+	async function handleProposeRedraft(ctx: ExtensionContext): Promise<void> {
+		if (!issue || !state.phase || !state.redraftDiagnosis) return;
+		const myAgentId = await getAgentId(pi);
+		const reason = `propose_redraft: ${state.redraftDiagnosis}`;
+		try {
+			await transitionPhase(pi, {
+				issueId: issue.id,
+				from: state.phase,
+				to: "aborted",
+				agentId: myAgentId,
+				reason,
+			});
+		} catch (err) {
+			ctx.ui.notify(`Could not transition to aborted: ${err}`, "error");
+			return;
+		}
+		if (myAgentId) await releaseIssue(pi, issue.id, myAgentId);
+		ctx.ui.notify(
+			`Issue #${issue.id} aborted (planner asked for redraft). Run /bs-design to revise the issue.`,
+			"info",
+		);
+		state = { ...IDLE_STATE };
+		issue = undefined;
+	}
+
+	// ── Plan review ────────────────────────────────────────────────────────────
+
+	async function handlePlanReview(ctx: ExtensionContext): Promise<void> {
+		if (!issue || !state.phase || !state.plan || !isPlanningPhase(state.phase)) return;
+		const planningPhase: PlanningPhase = state.phase;
 
 		const action = await showScrollableMarkdown<"accept" | "escape">(ctx, {
 			title: `Plan for issue #${issue.id}`,
@@ -626,225 +736,84 @@ export default function bogstandard(pi: ExtensionAPI) {
 		});
 
 		if (action === "accept") {
-			await options.onAccept(state.plan);
+			await acceptPlan(ctx, planningPhase, state.plan);
 			return;
 		}
 
-		// Refine or abort.
 		const choice = await ctx.ui.select("Plan not accepted — what next?", [
 			"Send instructions to the planner",
 			"Abort",
 		]);
-
 		if (!choice || choice === "Abort") {
-			reset();
-			ctx.ui.notify("Aborted after planning.", "info");
+			const myAgentId = await getAgentId(pi);
+			await abortIssue(ctx, "user aborted after planning", myAgentId);
 			return;
 		}
-
 		const refinement = await ctx.ui.editor("Instructions for the planner:", "");
 		if (refinement === undefined || refinement.trim() === "") {
 			ctx.ui.notify("No refinement entered; plan review left pending.", "info");
 			return;
 		}
-		await postDurableComment(ctx, "decision", "plan-refine-instructions", { phase: options.refinePhase }, refinement.trim());
-		state.phase = options.refinePhase;
-		persist();
+		const myAgentId = await getAgentId(pi);
+		try {
+			await appendPhaseEvent(pi, {
+				issueId: issue.id,
+				phase: planningPhase,
+				agentId: myAgentId,
+				reason: "plan-refine-instructions",
+				metadata: { instructions: refinement.trim() },
+			});
+		} catch {
+			// non-fatal
+		}
+		state.plan = undefined;
 		pi.sendUserMessage(refinement.trim());
 	}
 
-	async function postDurableComment(
-		ctx: ExtensionContext,
-		kind: import("./db.js").CommentKind,
-		event: string,
-		attrs: Record<string, string> = {},
-		body = "",
-	): Promise<void> {
+	async function acceptPlan(ctx: ExtensionContext, from: PlanningPhase, plan: string): Promise<void> {
 		if (!issue) return;
-		const header = buildBsHeader(event, attrs);
-		const text = body ? `${header}\n\n${body}` : header;
+		const to = implementingFor(from);
+		const myAgentId = await getAgentId(pi);
 		try {
-			await issueComment(pi, issue.id, kind, text);
+			await transitionPhase(pi, {
+				issueId: issue.id,
+				from,
+				to,
+				agentId: myAgentId,
+				reason: "plan accepted",
+				metadata: { plan },
+			});
 		} catch (err) {
-			ctx.ui.notify(`Failed to post durable event (${event}): ${err}`, "error");
-		}
-	}
-
-	async function postPlanComment(
-		ctx: ExtensionContext,
-		planningPhase: "planning" | "planning-red" | "planning-green",
-		plan: string,
-	): Promise<void> {
-		await postDurableComment(ctx, "plan", "plan-accepted", { phase: planningPhase }, plan);
-	}
-
-	/**
-	 * Resolve which model to use for the given phase, following the flag
-	 * precedence: per-sub-phase override > broad plan/impl flag > undefined
-	 * (no switch).
-	 */
-	function resolveModelFor(phase: Phase): string | undefined {
-		const broadPlan = pi.getFlag("bs-plan-model") as string | undefined;
-		const broadImpl = pi.getFlag("bs-impl-model") as string | undefined;
-		const get = (name: string) => pi.getFlag(name) as string | undefined;
-		switch (phase) {
-			case "planning":
-				return broadPlan;
-			case "implementing":
-				return broadImpl;
-			case "planning-red":
-				return get("bs-red-plan-model") ?? broadPlan;
-			case "implementing-red":
-				return get("bs-red-impl-model") ?? broadImpl;
-			case "planning-green":
-				return get("bs-green-plan-model") ?? broadPlan;
-			case "implementing-green":
-				return get("bs-green-impl-model") ?? broadImpl;
-			default:
-				return undefined;
-		}
-	}
-
-	/**
-	 * Switch pi's active model for the given phase if a flag-resolved spec
-	 * exists. Errors (bad spec, unknown model, missing API key) are surfaced
-	 * via notification but do not block the phase transition — the user can
-	 * /model into something appropriate and pi -r will pick up.
-	 */
-	async function switchModelForPhase(ctx: ExtensionContext, phase: Phase): Promise<void> {
-		const spec = resolveModelFor(phase);
-		if (!spec) return;
-
-		const slash = spec.indexOf("/");
-		if (slash < 0) {
-			ctx.ui.notify(`Invalid /bs-task model spec '${spec}' — expected provider/id.`, "error");
+			ctx.ui.notify(`Could not transition to ${to}: ${err}`, "error");
 			return;
 		}
-		const provider = spec.slice(0, slash);
-		const id = spec.slice(slash + 1);
+		state.phase = to;
+		state.plan = plan;
 
-		const model = ctx.modelRegistry.find(provider, id);
-		if (!model) {
-			ctx.ui.notify(`/bs-task: model not found: ${spec}`, "error");
-			return;
+		let prompt: string;
+		let tools: string[];
+		if (to === "implementing") {
+			prompt = buildImplementPrompt(issue, plan);
+			tools = IMPL_TOOLS;
+		} else if (to === "red_impl") {
+			prompt = buildRedImplementPrompt(issue, plan);
+			tools = IMPL_TOOLS;
+		} else {
+			const diff = state.redDiff ?? "(unavailable — check `git log` for the red commit)";
+			prompt = buildGreenImplementPrompt(issue, plan, diff);
+			tools = GREEN_IMPL_TOOLS;
 		}
-
-		const ok = await pi.setModel(model);
-		if (!ok) {
-			ctx.ui.notify(`/bs-task: no API key configured for ${spec}`, "error");
-		}
+		await kickoffPhase(ctx, to, customTypeForPhase(to), prompt, tools);
 	}
 
-	function buildPhaseSystemPrompt(phase: Phase, base: string): string {
-		switch (phase) {
-			case "planning":
-			case "planning-red":
-			case "planning-green":
-				return buildPlannerSystemPrompt();
-			case "implementing":
-			case "implementing-red":
-				return buildImplementerSystemPrompt();
-			case "implementing-green":
-				return buildGreenImplementerSystemPrompt();
-			default:
-				return base;
-		}
-	}
+	// ── Implementation end ────────────────────────────────────────────────────
 
-	function customTypeForPhase(phase: Phase): string {
-		switch (phase) {
-			case "planning":           return "bs-task-plan-prompt";
-			case "planning-red":       return "bs-task-red-plan-prompt";
-			case "planning-green":     return "bs-task-green-plan-prompt";
-			case "implementing":       return "bs-task-impl-prompt";
-			case "implementing-red":   return "bs-task-red-impl-prompt";
-			case "implementing-green": return "bs-task-green-impl-prompt";
-			default:                   return "bs-task-prompt";
-		}
-	}
-
-	async function kickoffPhase(
-		ctx: ExtensionContext,
-		phase: Phase,
-		customType: string,
-		content: string,
-		tools: string[],
-	): Promise<void> {
-		state.lastPrompt = content;
-		persist();
-		await switchModelForPhase(ctx, phase);
-		pi.setActiveTools(tools);
-		if (pi.getFlag("bs-debug")) {
-			const systemPrompt = buildPhaseSystemPrompt(phase, "");
-			pi.sendMessage(
-				{ content: `**[bs-task-debug] ${phase} — system prompt**\n\n${systemPrompt}`, display: true },
-				{ triggerTurn: false },
-			);
-			pi.sendMessage(
-				{ content: `**[bs-task-debug] ${phase} — user prompt**\n\n${content}`, display: true },
-				{ triggerTurn: false },
-			);
-		}
-		setTimeout(() => {
-			pi.sendMessage({ customType, content, display: false }, { triggerTurn: true });
-		}, 0);
-	}
-
-	async function handleInterrupt(ctx: ExtensionContext): Promise<void> {
-		const phase = state.phase;
-
-		if (phase === "implementing" || phase === "implementing-red" || phase === "implementing-green") {
-			await handleImplementationEnd(ctx, true);
-			return;
-		}
-
-		if (phase.startsWith("planning")) {
-			const choice = await ctx.ui.select("Phase interrupted — what next?", [
-				"Continue (resume planner)",
-				"Abort",
-			]);
-			if (!choice || choice === "Abort") {
-				reset();
-				ctx.ui.notify("Aborted. Issue left open.", "info");
-				return;
-			}
-			const correction = await ctx.ui.editor("Correction for the planner (leave blank to resume):", "");
-			if (correction === undefined) {
-				reset();
-				ctx.ui.notify("Aborted. Issue left open.", "info");
-				return;
-			}
-			if (correction.trim()) {
-				await postDurableComment(ctx, "decision", "interrupt-resolved", { choice: "continue" }, correction.trim());
-				pi.sendUserMessage(correction.trim());
-				return;
-			}
-			await postDurableComment(ctx, "decision", "interrupt-resolved", { choice: "continue" });
-			if (!state.lastPrompt) {
-				ctx.ui.notify("No saved prompt to resume from. Re-run /bs-task.", "error");
-				return;
-			}
-			const tools = activeToolsForPhase(phase)!;
-			await kickoffPhase(ctx, phase, customTypeForPhase(phase), state.lastPrompt, tools);
-			return;
-		}
-
-		// reviewing-* or unexpected phase: treat as abort
-		reset();
-		ctx.ui.notify("Unexpected interrupt during review phase; state reset.", "warning");
-	}
-
-	async function handleImplementationEnd(
-		ctx: ExtensionContext,
-		isInterrupted: boolean,
-	): Promise<void> {
-		if (!issue) return;
-		const phase = state.phase;
+	async function handleImplementationEnd(ctx: ExtensionContext, isInterrupted: boolean): Promise<void> {
+		if (!issue || !state.phase || !isImplementingPhase(state.phase)) return;
+		const phase: ImplementingPhase = state.phase;
 
 		const doneLabel =
-			phase === "implementing-red"
-				? "Done (proceed to green phase)"
-				: "Done (close and commit)";
+			phase === "red_impl" ? "Done (proceed to green phase)" : "Done (close and commit)";
 
 		const choice = await ctx.ui.select(
 			isInterrupted ? "Phase interrupted — what next?" : "Implementation complete — what next?",
@@ -856,12 +825,9 @@ export default function bogstandard(pi: ExtensionAPI) {
 		);
 
 		if (!choice || choice.startsWith("Done")) {
-			if (isInterrupted) {
-				await postDurableComment(ctx, "decision", "interrupt-resolved", { choice: "close-commit" });
-			}
 			if (phase === "implementing") {
 				await closeAndCommit(ctx, issue);
-			} else if (phase === "implementing-red") {
+			} else if (phase === "red_impl") {
 				await finalizeRedImplementation(ctx);
 			} else {
 				if (state.bailReason !== undefined) await handleBail(ctx);
@@ -874,26 +840,24 @@ export default function bogstandard(pi: ExtensionAPI) {
 			const defaultPrompt = isInterrupted ? (state.lastPrompt ?? "") : "";
 			const userInput = await ctx.ui.editor("Message to the agent:", defaultPrompt);
 			if (userInput === undefined) {
-				reset();
-				ctx.ui.notify("Aborted. Issue left open.", "info");
+				const myAgentId = await getAgentId(pi);
+				if (myAgentId) await releaseIssue(pi, issue.id, myAgentId);
+				ctx.ui.notify("Aborted in-session. Issue left in-progress; re-run /bs-task to resume.", "info");
+				state = { ...IDLE_STATE };
+				issue = undefined;
 				return;
 			}
 			let prompt = userInput.trim() || defaultPrompt;
 			if (!prompt) {
-				// Rebuild from issue + state (recovery path: lastPrompt was lost with the session).
 				if (phase === "implementing" && state.plan) {
 					prompt = buildImplementPrompt(issue, state.plan);
-				} else if (phase === "implementing-red" && state.plan) {
+				} else if (phase === "red_impl" && state.plan) {
 					prompt = buildRedImplementPrompt(issue, state.plan);
-				} else if (phase === "implementing-green" && state.plan && state.redDiff) {
+				} else if (phase === "green_impl" && state.plan && state.redDiff) {
 					prompt = buildGreenImplementPrompt(issue, state.plan, state.redDiff);
 				} else {
 					prompt = "Continue working on the implementation.";
 				}
-			}
-			if (isInterrupted) {
-				const body = userInput.trim() || "(no additional instructions)";
-				await postDurableComment(ctx, "decision", "interrupt-resolved", { choice: "continue" }, body);
 			}
 			const tools = activeToolsForPhase(phase)!;
 			await kickoffPhase(ctx, phase, customTypeForPhase(phase), prompt, tools);
@@ -901,13 +865,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		}
 
 		// Not done, quitting
-		if (isInterrupted) {
-			await postDurableComment(ctx, "decision", "interrupt-resolved", { choice: "abort" });
-		}
-		const comment = await ctx.ui.editor(
-			"Comment for the issue (leave blank to skip):",
-			"",
-		);
+		const comment = await ctx.ui.editor("Comment for the issue (leave blank to skip):", "");
 		if (comment !== undefined && comment.trim()) {
 			try {
 				await issueComment(pi, issue.id, "human", comment.trim());
@@ -915,99 +873,105 @@ export default function bogstandard(pi: ExtensionAPI) {
 				ctx.ui.notify(`Failed to post comment: ${err}`, "warning");
 			}
 		}
-
 		try {
 			await addAll(pi);
-			await commit(
-				pi,
-				`[WIP] ${issue.title}`,
-				"Work in progress — session ended without completing issue.",
-			);
+			await commit(pi, `[WIP] ${issue.title}`, "Work in progress — session ended without completing issue.");
 		} catch (err) {
 			ctx.ui.notify(`Failed to commit incomplete work: ${err}`, "warning");
 		}
-
-		ctx.ui.notify(`Issue #${issue.id} left open. Incomplete work committed.`, "info");
-		reset();
+		const myAgentId = await getAgentId(pi);
+		try {
+			await appendPhaseEvent(pi, {
+				issueId: issue.id,
+				phase,
+				agentId: myAgentId,
+				reason: "user quit mid-phase, WIP committed",
+			});
+		} catch {
+			// non-fatal
+		}
+		if (myAgentId) await releaseIssue(pi, issue.id, myAgentId);
+		ctx.ui.notify(
+			`Issue #${issue.id} left in phase '${phase}'. Re-run /bs-task ${issue.id} to resume.`,
+			"info",
+		);
+		state = { ...IDLE_STATE };
+		issue = undefined;
 	}
 
-	// === No-tests path ===
+	// ── Interrupt ─────────────────────────────────────────────────────────────
 
-	async function handleNoTestsPlanReview(ctx: ExtensionContext): Promise<void> {
-		await reviewPlanUI(ctx, {
-			refinePhase: "planning",
-			onAccept: async (plan) => {
-				if (!issue) return;
-				await postPlanComment(ctx, "planning", plan);
-				state.phase = "implementing";
-				persist();
-				await kickoffPhase(
-					ctx,
-					"implementing",
-					"bs-task-impl-prompt",
-					buildImplementPrompt(issue, plan),
-					IMPL_TOOLS,
-				);
-			},
-		});
+	async function handleInterrupt(ctx: ExtensionContext): Promise<void> {
+		const phase = state.phase;
+		if (phase === undefined) return;
+
+		if (isImplementingPhase(phase)) {
+			await handleImplementationEnd(ctx, true);
+			return;
+		}
+		if (isPlanningPhase(phase)) {
+			const choice = await ctx.ui.select("Phase interrupted — what next?", [
+				"Continue (resume planner)",
+				"Abort",
+			]);
+			if (!choice || choice === "Abort") {
+				const myAgentId = await getAgentId(pi);
+				await abortIssue(ctx, "user aborted after interrupt", myAgentId);
+				return;
+			}
+			const correction = await ctx.ui.editor("Correction for the planner (leave blank to resume):", "");
+			if (correction === undefined) {
+				const myAgentId = await getAgentId(pi);
+				await abortIssue(ctx, "user cancelled correction editor", myAgentId);
+				return;
+			}
+			if (correction.trim()) {
+				pi.sendUserMessage(correction.trim());
+				return;
+			}
+			if (!state.lastPrompt) {
+				ctx.ui.notify("No saved prompt to resume from. Re-run /bs-task.", "error");
+				return;
+			}
+			const tools = activeToolsForPhase(phase)!;
+			await kickoffPhase(ctx, phase, customTypeForPhase(phase), state.lastPrompt, tools);
+			return;
+		}
+
+		const myAgentId = await getAgentId(pi);
+		await abortIssue(ctx, `unexpected interrupt during '${phase}'`, myAgentId);
 	}
 
-	// === Red phase (TDD) ===
-
-	async function handleRedPlanReview(ctx: ExtensionContext): Promise<void> {
-		await reviewPlanUI(ctx, {
-			refinePhase: "planning-red",
-			onAccept: async (plan) => {
-				if (!issue) return;
-				await postPlanComment(ctx, "planning-red", plan);
-				state.phase = "implementing-red";
-				persist();
-				await kickoffPhase(
-					ctx,
-					"implementing-red",
-					"bs-task-red-impl-prompt",
-					buildRedImplementPrompt(issue, plan),
-					IMPL_TOOLS,
-				);
-			},
-		});
-	}
+	// ── Red phase finalization ────────────────────────────────────────────────
 
 	async function finalizeRedImplementation(ctx: ExtensionContext): Promise<void> {
 		if (!issue) return;
-
 		try {
 			await addAll(pi);
 		} catch (err) {
 			ctx.ui.notify(`Failed to stage red changes: ${err}`, "error");
 			return;
 		}
-
 		const hasChanges = await hasStagedChanges(pi);
 		if (!hasChanges) {
 			ctx.ui.notify(
-				"Red phase produced no changes. The implementer was supposed to write failing tests. Use /bs-task to retry or pi -r to resume.",
+				"Red phase produced no changes. The implementer was supposed to write failing tests. Use /bs-task to retry.",
 				"error",
 			);
-			// Leave phase at implementing-red so resume picks up.
 			return;
 		}
-
 		try {
 			await commit(pi, issue.title, "Testing phase: red");
 		} catch (err) {
 			ctx.ui.notify(`Failed to commit red phase: ${err}`, "error");
 			return;
 		}
-
 		let sha = "unknown";
 		try {
 			sha = await headShortSha(pi);
 		} catch {
-			// non-fatal: SHA is best-effort
+			// non-fatal
 		}
-		await postDurableComment(ctx, "result", "red-commit", { sha }, `Red phase committed at ${sha}`);
-
 		let diff: string;
 		try {
 			diff = await showHeadDiff(pi);
@@ -1016,46 +980,38 @@ export default function bogstandard(pi: ExtensionAPI) {
 			return;
 		}
 
-		// Hand off to the green planner.
+		const myAgentId = await getAgentId(pi);
+		try {
+			await transitionPhase(pi, {
+				issueId: issue.id,
+				from: "red_impl",
+				to: "green_planning",
+				agentId: myAgentId,
+				reason: "red phase committed",
+				metadata: { red_sha: sha, red_diff: diff },
+			});
+		} catch (err) {
+			ctx.ui.notify(`Could not transition to green_planning: ${err}`, "error");
+			return;
+		}
+
 		state.plan = undefined;
 		state.redDiff = diff;
-		state.phase = "planning-green";
-		persist();
+		state.phase = "green_planning";
 		await kickoffPhase(
 			ctx,
-			"planning-green",
-			"bs-task-green-plan-prompt",
+			"green_planning",
+			customTypeForPhase("green_planning"),
 			buildGreenPlanPrompt(issue, diff),
 			PLAN_TOOLS,
 		);
 	}
 
-	// === Green phase (TDD) ===
-
-	async function handleGreenPlanReview(ctx: ExtensionContext): Promise<void> {
-		await reviewPlanUI(ctx, {
-			refinePhase: "planning-green",
-			onAccept: async (plan) => {
-				if (!issue || !state.redDiff) return;
-				await postPlanComment(ctx, "planning-green", plan);
-				state.phase = "implementing-green";
-				persist();
-				await kickoffPhase(
-					ctx,
-					"implementing-green",
-					"bs-task-green-impl-prompt",
-					buildGreenImplementPrompt(issue, plan, state.redDiff),
-					GREEN_IMPL_TOOLS,
-				);
-			},
-		});
-	}
+	// ── Green bail ────────────────────────────────────────────────────────────
 
 	async function handleBail(ctx: ExtensionContext): Promise<void> {
 		if (!issue || state.bailReason === undefined) return;
 		const reason = state.bailReason;
-
-		await postDurableComment(ctx, "blocker", "green-bail", {}, reason);
 
 		const addComment = await ctx.ui.confirm(
 			"Bail recorded. Add a comment before restarting the red phase?",
@@ -1072,6 +1028,14 @@ export default function bogstandard(pi: ExtensionAPI) {
 			}
 		}
 
+		// Capture the red sha (HEAD before reset) so resume can roll back if interrupted.
+		let bailSha = "unknown";
+		try {
+			bailSha = await headShortSha(pi);
+		} catch {
+			// non-fatal
+		}
+
 		try {
 			await resetHardHeadMinus1(pi);
 		} catch (err) {
@@ -1082,15 +1046,26 @@ export default function bogstandard(pi: ExtensionAPI) {
 			return;
 		}
 
-		// Reset TDD-specific state, keep the same issue.
+		const myAgentId = await getAgentId(pi);
+		try {
+			await transitionPhase(pi, {
+				issueId: issue.id,
+				from: "green_impl",
+				to: "red_planning",
+				agentId: myAgentId,
+				reason: `green bail: ${reason}`,
+				metadata: { bail_sha: bailSha, bail_reason: reason },
+			});
+		} catch (err) {
+			ctx.ui.notify(`Could not transition to red_planning after bail: ${err}`, "error");
+			return;
+		}
+
 		state.plan = undefined;
 		state.redDiff = undefined;
 		state.bailReason = undefined;
-		state.phase = "planning-red";
-		persist();
+		state.phase = "red_planning";
 
-		// Refetch the issue so the next red plan sees the bail diagnosis + any
-		// human comment the operator just added.
 		try {
 			issue = await issueShowJson(pi, issue.id);
 		} catch (err) {
@@ -1101,24 +1076,24 @@ export default function bogstandard(pi: ExtensionAPI) {
 		ctx.ui.notify("Bail handled. Restarting red phase with updated context.", "info");
 		await kickoffPhase(
 			ctx,
-			"planning-red",
-			"bs-task-red-plan-prompt",
+			"red_planning",
+			customTypeForPhase("red_planning"),
 			buildRedPlanPrompt(issue),
 			PLAN_TOOLS,
 		);
 	}
 
-	// === Shared close + commit ===
+	// ── Close + commit ────────────────────────────────────────────────────────
 
 	async function closeAndCommit(ctx: ExtensionContext, currentIssue: IssueDetail): Promise<void> {
-		// Check for changes before closing so we can offer an escape hatch if the
-		// implementation made no file modifications (e.g. a verification-only issue).
 		let clean = false;
 		try {
 			clean = await isClean(pi);
 		} catch {
-			// if the check fails, proceed normally and let git commit surface the error
+			// proceed normally
 		}
+
+		const myAgentId = await getAgentId(pi);
 
 		if (clean) {
 			while (true) {
@@ -1131,8 +1106,8 @@ export default function bogstandard(pi: ExtensionAPI) {
 					],
 				);
 				if (!choice || choice.startsWith("Abort")) {
-					await locksRelease(pi, currentIssue.id);
-					ctx.ui.notify("Aborted. Issue left open.", "info");
+					if (myAgentId) await releaseIssue(pi, currentIssue.id, myAgentId);
+					ctx.ui.notify("Aborted. Issue left in-progress.", "info");
 					return;
 				}
 				if (choice.startsWith("Add a comment")) {
@@ -1146,32 +1121,26 @@ export default function bogstandard(pi: ExtensionAPI) {
 					}
 					continue;
 				}
-				break; // "Close issue without committing"
+				break; // close without commit
 			}
-
 			try {
-				await issueClose(pi, currentIssue.id);
+				await transitionPhase(pi, {
+					issueId: currentIssue.id,
+					from: state.phase,
+					to: "done",
+					agentId: myAgentId,
+					reason: "closed without file changes",
+				});
 			} catch (err) {
 				ctx.ui.notify(`Failed to close issue: ${err}`, "error");
 				return;
 			}
-			await locksRelease(pi, currentIssue.id);
-			await postDurableComment(ctx, "resolution", "closed", {}, `Issue #${currentIssue.id} closed.`);
+			if (myAgentId) await releaseIssue(pi, currentIssue.id, myAgentId);
 			ctx.ui.notify(`Issue #${currentIssue.id} closed (no files changed).`, "info");
-			state = { phase: "done", issueId: currentIssue.id };
+			state = { ...IDLE_STATE };
 			issue = undefined;
-			persist();
 			return;
 		}
-
-		try {
-			await issueClose(pi, currentIssue.id);
-		} catch (err) {
-			ctx.ui.notify(`Failed to close issue: ${err}`, "error");
-			return;
-		}
-		await locksRelease(pi, currentIssue.id);
-		await postDurableComment(ctx, "resolution", "closed", {}, `Issue #${currentIssue.id} closed.`);
 
 		try {
 			await addAll(pi);
@@ -1192,99 +1161,134 @@ export default function bogstandard(pi: ExtensionAPI) {
 		} catch {
 			// non-fatal
 		}
-		await postDurableComment(ctx, "result", "final-commit", { sha }, `Final commit at ${sha}`);
 
-		ctx.ui.notify(`Issue #${currentIssue.id} closed and committed.`, "info");
-		state = { phase: "done", issueId: currentIssue.id };
+		try {
+			await transitionPhase(pi, {
+				issueId: currentIssue.id,
+				from: state.phase,
+				to: "done",
+				agentId: myAgentId,
+				reason: "implementation committed",
+				metadata: { final_sha: sha },
+			});
+		} catch (err) {
+			ctx.ui.notify(`Failed to close issue: ${err}`, "error");
+			return;
+		}
+		if (myAgentId) await releaseIssue(pi, currentIssue.id, myAgentId);
+
+		ctx.ui.notify(`Issue #${currentIssue.id} closed and committed (${sha}).`, "info");
+		state = { ...IDLE_STATE };
 		issue = undefined;
-		persist();
 	}
 
-	async function runResumeReviewLoop(ctx: ExtensionContext): Promise<boolean> {
-		while (issue) {
+	// ── Kickoff + model selection ─────────────────────────────────────────────
+
+	function resolveModelFor(phase: Phase): string | undefined {
+		const broadPlan = pi.getFlag("bs-plan-model") as string | undefined;
+		const broadImpl = pi.getFlag("bs-impl-model") as string | undefined;
+		const get = (name: string) => pi.getFlag(name) as string | undefined;
+		switch (phase) {
+			case "planning":        return broadPlan;
+			case "implementing":    return broadImpl;
+			case "red_planning":    return get("bs-red-plan-model")   ?? broadPlan;
+			case "red_impl":        return get("bs-red-impl-model")   ?? broadImpl;
+			case "green_planning":  return get("bs-green-plan-model") ?? broadPlan;
+			case "green_impl":      return get("bs-green-impl-model") ?? broadImpl;
+			default:                return undefined;
+		}
+	}
+
+	async function switchModelForPhase(ctx: ExtensionContext, phase: Phase): Promise<void> {
+		const spec = resolveModelFor(phase);
+		if (!spec) return;
+		const slash = spec.indexOf("/");
+		if (slash < 0) {
+			ctx.ui.notify(`Invalid /bs-task model spec '${spec}' — expected provider/id.`, "error");
+			return;
+		}
+		const provider = spec.slice(0, slash);
+		const id = spec.slice(slash + 1);
+		const model = ctx.modelRegistry.find(provider, id);
+		if (!model) {
+			ctx.ui.notify(`/bs-task: model not found: ${spec}`, "error");
+			return;
+		}
+		const ok = await pi.setModel(model);
+		if (!ok) ctx.ui.notify(`/bs-task: no API key configured for ${spec}`, "error");
+	}
+
+	function buildPhaseSystemPrompt(phase: Phase, base: string): string {
+		switch (phase) {
+			case "planning":
+			case "red_planning":
+			case "green_planning":
+				return buildPlannerSystemPrompt();
+			case "implementing":
+			case "red_impl":
+				return buildImplementerSystemPrompt();
+			case "green_impl":
+				return buildGreenImplementerSystemPrompt();
+			default:
+				return base;
+		}
+	}
+
+	function customTypeForPhase(phase: Phase): string {
+		switch (phase) {
+			case "planning":        return "bs-task-plan-prompt";
+			case "red_planning":    return "bs-task-red-plan-prompt";
+			case "green_planning":  return "bs-task-green-plan-prompt";
+			case "implementing":    return "bs-task-impl-prompt";
+			case "red_impl":        return "bs-task-red-impl-prompt";
+			case "green_impl":      return "bs-task-green-impl-prompt";
+			default:                return "bs-task-prompt";
+		}
+	}
+
+	async function kickoffPhase(
+		ctx: ExtensionContext,
+		phase: Phase,
+		customType: string,
+		content: string,
+		tools: string[],
+	): Promise<void> {
+		state.lastPrompt = content;
+		await switchModelForPhase(ctx, phase);
+		pi.setActiveTools(tools);
+		if (pi.getFlag("bs-debug")) {
+			const systemPrompt = buildPhaseSystemPrompt(phase, "");
 			pi.sendMessage(
-				{
-					customType: "bs-task-issue",
-					content: `## ${formatIssueLabel(issue)}\n\n${buildIssueDisplay(issue)}`,
-					display: true,
-				},
+				{ content: `**[bs-task-debug] ${phase} — system prompt**\n\n${systemPrompt}`, display: true },
 				{ triggerTurn: false },
 			);
-
-			const choice = await ctx.ui.select(
-				`Recovering issue #${issue.id} (phase: ${state.phase}) — what next?`,
-				["Continue", "Add a comment", "Abort"],
+			pi.sendMessage(
+				{ content: `**[bs-task-debug] ${phase} — user prompt**\n\n${content}`, display: true },
+				{ triggerTurn: false },
 			);
-
-			if (!choice || choice === "Abort") {
-				await locksRelease(pi, issue.id);
-				ctx.ui.notify("Recovery aborted.", "info");
-				return false;
-			}
-
-			if (choice.startsWith("Add")) {
-				const body = await ctx.ui.editor("Comment:", "");
-				if (body !== undefined && body.trim() !== "") {
-					try {
-						await issueComment(pi, issue.id, "human", body);
-						issue = await issueShowJson(pi, issue.id);
-					} catch (err) {
-						ctx.ui.notify(`Failed to post comment: ${err}`, "error");
-					}
-				}
-				continue;
-			}
-
-			return true;
 		}
-		return false;
+		setTimeout(() => {
+			pi.sendMessage({ customType, content, display: false }, { triggerTurn: true });
+		}, 0);
 	}
 
-	async function routeRecoveredState(ctx: ExtensionContext): Promise<void> {
-		if (!issue) return;
-		const confirmed = await runResumeReviewLoop(ctx);
-		if (!confirmed) return;
-		const phase = state.phase;
+	function activeToolsForPhase(phase: Phase): string[] | undefined {
 		switch (phase) {
-			case "done":
-				ctx.ui.notify(`Issue #${issue.id} is already done.`, "info");
-				return;
-			case "implementing":
-			case "implementing-red":
-			case "implementing-green":
-				await handleImplementationEnd(ctx, false);
-				return;
 			case "planning":
-				await kickoffPhase(ctx, "planning", customTypeForPhase("planning"), buildPlanPrompt(issue), PLAN_TOOLS);
-				return;
-			case "planning-red": {
-				// When recovering after a bail, reset git to before the red commit so the
-				// history is clean for the next TDD cycle. bailRedSha is the short SHA of
-				// the red commit; resetting to its parent undoes it and any commits on top
-				// (e.g. a WIP commit from "Not done, quitting" before the session crashed).
-				if (state.bailRedSha) {
-					const sha = state.bailRedSha;
-					ctx.ui.notify(`Resetting git to before the red commit (${sha}) to clean up the aborted TDD cycle.`, "info");
-					try {
-						await resetHardToRef(pi, `${sha}~1`);
-					} catch (err) {
-						ctx.ui.notify(`Could not auto-reset to ${sha}~1: ${err}. Run 'git reset --hard ${sha}~1' manually before continuing.`, "warning");
-					}
-					state.bailRedSha = undefined;
-					persist();
-				}
-				await kickoffPhase(ctx, "planning-red", customTypeForPhase("planning-red"), buildRedPlanPrompt(issue), PLAN_TOOLS);
-				return;
-			}
-			case "planning-green": {
-				const diff = state.redDiff ?? "(unavailable — check `git log` for the red commit)";
-				await kickoffPhase(ctx, "planning-green", customTypeForPhase("planning-green"), buildGreenPlanPrompt(issue, diff), PLAN_TOOLS);
-				return;
-			}
+			case "red_planning":
+			case "green_planning":
+				return PLAN_TOOLS;
+			case "implementing":
+			case "red_impl":
+				return IMPL_TOOLS;
+			case "green_impl":
+				return GREEN_IMPL_TOOLS;
 			default:
-				ctx.ui.notify(`Recovered to phase '${phase}' — re-run /bs-task to continue.`, "warning");
+				return undefined;
 		}
 	}
+
+	// ── session_start: configure DB, restore state ────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
 		try {
@@ -1297,58 +1301,28 @@ export default function bogstandard(pi: ExtensionAPI) {
 			);
 		} catch (err) {
 			ctx.ui.notify(
-				`/bs-task: postgres configuration not loaded — ${err instanceof Error ? err.message : String(err)}. Run 'npm run setup' to create .bogstandard/config.json.`,
+				`/bs-task: postgres configuration not loaded — ${err instanceof Error ? err.message : String(err)}. Run 'bs-setup' to create .bogstandard/config.json.`,
 				"error",
 			);
 			return;
 		}
-		state = loadState(ctx);
-		if (state.issueId !== undefined && state.phase !== "idle" && state.phase !== "done") {
+
+		const agentId = await getAgentId(pi);
+		state = await loadState(pi, agentId);
+		if (state.issueId !== undefined) {
 			try {
 				issue = await issueShowJson(pi, state.issueId);
 			} catch {
-				ctx.ui.notify(
-					`Could not refetch issue #${state.issueId}; resetting /bs-task state.`,
-					"warning",
-				);
-				reset();
+				ctx.ui.notify(`Could not refetch issue #${state.issueId}; clearing state.`, "warning");
+				state = { ...IDLE_STATE };
+				issue = undefined;
 				return;
 			}
 		}
-		const tools = activeToolsForPhase(state.phase);
-		if (tools !== undefined) {
-			pi.setActiveTools(tools);
-		}
-		// Honor freshly-passed --bs-*-model flags on resume. Without this,
-		// `pi -r --bs-plan-model x` mid-planning would keep the session's
-		// previous model until the next phase transition.
-		await switchModelForPhase(ctx, state.phase);
+
+		const tools = state.phase ? activeToolsForPhase(state.phase) : undefined;
+		if (tools !== undefined) pi.setActiveTools(tools);
+
+		if (state.phase) await switchModelForPhase(ctx, state.phase);
 	});
-}
-
-function hasBsEvents(iss: IssueDetail): boolean {
-	return (iss.comments ?? []).some((c) => parseBsHeader(c.content.split("\n")[0]) !== null);
-}
-
-/**
- * Tool set associated with a phase, used on session resume to restore the
- * right active tools without re-running the kickoff side-effects.
- */
-function activeToolsForPhase(phase: Phase): string[] | undefined {
-	switch (phase) {
-		case "planning":
-		case "reviewing-plan":
-		case "planning-red":
-		case "reviewing-red-plan":
-		case "planning-green":
-		case "reviewing-green-plan":
-			return PLAN_TOOLS;
-		case "implementing":
-		case "implementing-red":
-			return IMPL_TOOLS;
-		case "implementing-green":
-			return GREEN_IMPL_TOOLS;
-		default:
-			return undefined;
-	}
 }

@@ -1,4 +1,4 @@
-/* 
+/*
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted.
  *
@@ -13,18 +13,18 @@
 
 /**
  * Pure utilities for the draft edit-buffer format used in the Designer's
- * review UI. Extracted into its own module so they can be unit-tested without
- * pulling in the pi extension runtime or typebox.
+ * review UI.
  *
  * Buffer format:
  *   title: <one line of free text, may contain colons>
  *   priority: low | medium | high | critical
+ *   needs_tests: true | false
  *   ---
  *   <description markdown body, may be empty>
  *
  * Parsing rules:
- *   - Find the first line that is exactly "---"; everything above is the header,
- *     everything below is the description body.
+ *   - Find the first line that is exactly "---"; everything above is the
+ *     header, everything below is the description body.
  *   - Header lines are parsed as "key: value" by splitting on the first ": ".
  *     Any line without ": " is silently skipped.
  *   - Title may contain colons; only the first ": " is used as the delimiter.
@@ -36,6 +36,7 @@ import type { IssueDetail } from "./db.js";
 export interface DraftEditFields {
 	title: string;
 	priority: string;
+	needs_tests: boolean;
 	description: string;
 }
 
@@ -55,16 +56,26 @@ export function parseDraftEditBuffer(text: string): DraftEditFields {
 	if (!title) throw new Error("Missing or empty title field");
 	const priority = fields["priority"]?.trim() ?? "";
 	assertPriority(priority);
+	const rawNeedsTests = fields["needs_tests"]?.trim().toLowerCase() ?? "";
+	if (rawNeedsTests !== "true" && rawNeedsTests !== "false") {
+		throw new Error(
+			`needs_tests must be 'true' or 'false' (got '${rawNeedsTests || "(missing)"}')`,
+		);
+	}
 	const description = lines.slice(sepIdx + 1).join("\n").trim();
-	return { title, priority, description };
+	return { title, priority, needs_tests: rawNeedsTests === "true", description };
 }
 
 export function formatDraftForEdit(issue: IssueDetail): string {
-	return `title: ${issue.title}\npriority: ${issue.priority ?? "medium"}\n---\n${issue.description ?? ""}`;
+	const needs = issue.needs_tests === null || issue.needs_tests === undefined ? "false" : String(issue.needs_tests);
+	return `title: ${issue.title}\npriority: ${issue.priority ?? "medium"}\nneeds_tests: ${needs}\n---\n${issue.description ?? ""}`;
 }
 
 export function formatDraftForReview(issue: IssueDetail): string {
-	const parts = [`**Priority:** ${issue.priority ?? "medium"}`];
+	const parts = [
+		`**Priority:** ${issue.priority ?? "medium"}`,
+		`**Needs tests:** ${issue.needs_tests === null || issue.needs_tests === undefined ? "(unset)" : String(issue.needs_tests)}`,
+	];
 	if (issue.description?.trim()) parts.push("", issue.description);
 	return parts.join("\n");
 }

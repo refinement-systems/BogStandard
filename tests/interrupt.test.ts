@@ -1,4 +1,4 @@
-/* 
+/*
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted.
  *
@@ -12,7 +12,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { endReason } from "../agent/extensions/bogstandard/phases.js";
+import { IDLE_STATE, endReason } from "../agent/extensions/bogstandard/phases.js";
 import type { BogstandardState } from "../agent/extensions/bogstandard/phases.js";
 
 function makeEvent(stopReason?: string) {
@@ -21,7 +21,7 @@ function makeEvent(stopReason?: string) {
 }
 
 function makeState(overrides: Partial<BogstandardState> = {}): BogstandardState {
-	return { phase: "implementing", ...overrides };
+	return { ...IDLE_STATE, issueId: 1, versionId: 1, phase: "implementing", ...overrides };
 }
 
 describe("endReason", () => {
@@ -29,27 +29,42 @@ describe("endReason", () => {
 		expect(endReason(makeEvent("stop"), makeState({ phase: "implementing" }))).toBe("completed");
 	});
 
-	it("returns completed on natural stop during implementing-green", () => {
-		expect(endReason(makeEvent("stop"), makeState({ phase: "implementing-green" }))).toBe("completed");
+	it("returns completed on natural stop during green_impl", () => {
+		expect(endReason(makeEvent("stop"), makeState({ phase: "green_impl" }))).toBe("completed");
 	});
 
-	it("returns tool-terminate when phase is reviewing-plan (save_plan path)", () => {
-		expect(endReason(makeEvent("aborted"), makeState({ phase: "reviewing-plan" }))).toBe("tool-terminate");
+	it("returns tool-terminate when planning + plan is set (save_plan path)", () => {
+		expect(
+			endReason(makeEvent("aborted"), makeState({ phase: "planning", plan: "p" })),
+		).toBe("tool-terminate");
 	});
 
-	it("returns tool-terminate when phase is reviewing-red-plan", () => {
-		expect(endReason(makeEvent("aborted"), makeState({ phase: "reviewing-red-plan" }))).toBe("tool-terminate");
+	it("returns tool-terminate for red_planning with plan set", () => {
+		expect(
+			endReason(makeEvent("aborted"), makeState({ phase: "red_planning", plan: "p" })),
+		).toBe("tool-terminate");
 	});
 
-	it("returns tool-terminate when phase is reviewing-green-plan", () => {
-		expect(endReason(makeEvent("aborted"), makeState({ phase: "reviewing-green-plan" }))).toBe("tool-terminate");
+	it("returns tool-terminate for green_planning with plan set", () => {
+		expect(
+			endReason(makeEvent("aborted"), makeState({ phase: "green_planning", plan: "p" })),
+		).toBe("tool-terminate");
 	});
 
-	it("returns tool-terminate when implementing-green with bailReason set (bail_out path)", () => {
+	it("returns tool-terminate when green_impl + bailReason is set (bail_out path)", () => {
 		expect(
 			endReason(
 				makeEvent("aborted"),
-				makeState({ phase: "implementing-green", bailReason: "impossible" }),
+				makeState({ phase: "green_impl", bailReason: "impossible" }),
+			),
+		).toBe("tool-terminate");
+	});
+
+	it("returns tool-terminate when redraftDiagnosis is set (propose_redraft path)", () => {
+		expect(
+			endReason(
+				makeEvent("stop"),
+				makeState({ phase: "planning", redraftDiagnosis: "design is wrong" }),
 			),
 		).toBe("tool-terminate");
 	});
@@ -58,20 +73,20 @@ describe("endReason", () => {
 		expect(endReason(makeEvent("aborted"), makeState({ phase: "implementing" }))).toBe("interrupted");
 	});
 
-	it("returns interrupted on aborted during implementing-red", () => {
-		expect(endReason(makeEvent("aborted"), makeState({ phase: "implementing-red" }))).toBe("interrupted");
+	it("returns interrupted on aborted during red_impl", () => {
+		expect(endReason(makeEvent("aborted"), makeState({ phase: "red_impl" }))).toBe("interrupted");
 	});
 
-	it("returns interrupted on aborted during implementing-green without bailReason", () => {
-		expect(endReason(makeEvent("aborted"), makeState({ phase: "implementing-green" }))).toBe("interrupted");
+	it("returns interrupted on aborted during green_impl without bailReason", () => {
+		expect(endReason(makeEvent("aborted"), makeState({ phase: "green_impl" }))).toBe("interrupted");
 	});
 
-	it("returns interrupted on aborted during planning", () => {
+	it("returns interrupted on aborted during planning (no plan yet)", () => {
 		expect(endReason(makeEvent("aborted"), makeState({ phase: "planning" }))).toBe("interrupted");
 	});
 
-	it("returns interrupted on aborted during planning-red", () => {
-		expect(endReason(makeEvent("aborted"), makeState({ phase: "planning-red" }))).toBe("interrupted");
+	it("returns interrupted on aborted during red_planning (no plan yet)", () => {
+		expect(endReason(makeEvent("aborted"), makeState({ phase: "red_planning" }))).toBe("interrupted");
 	});
 
 	it("returns completed when messages array is empty", () => {
@@ -82,20 +97,11 @@ describe("endReason", () => {
 		expect(endReason(makeEvent("length"), makeState({ phase: "implementing" }))).toBe("completed");
 	});
 
-	it("returns completed for stopReason toolUse", () => {
-		expect(endReason(makeEvent("toolUse"), makeState({ phase: "implementing" }))).toBe("completed");
-	});
-
-	it("returns completed for stopReason error", () => {
-		expect(endReason(makeEvent("error"), makeState({ phase: "implementing" }))).toBe("completed");
-	});
-
-	it("bail_out during implementing-green without aborted stopReason is still tool-terminate", () => {
-		// bail_out sets bailReason; stopReason check is secondary
+	it("bail_out during green_impl without aborted stopReason is still tool-terminate", () => {
 		expect(
 			endReason(
 				makeEvent("stop"),
-				makeState({ phase: "implementing-green", bailReason: "impossible" }),
+				makeState({ phase: "green_impl", bailReason: "impossible" }),
 			),
 		).toBe("tool-terminate");
 	});

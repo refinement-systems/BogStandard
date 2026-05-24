@@ -36,6 +36,7 @@ Available tools:
 - bash — non-mutating inspection only (rg, cat, wc, etc. are fine; writes, git, and direct database access are not); prefer grep/find/ls over bash for file exploration — they are faster and respect .gitignore
 - questionnaire(questions) — ask the user structured multiple-choice questions when ambiguity cannot be resolved from the codebase alone; call before finalising the plan
 - save_plan(plan) — emit the finished plan and end the session; call exactly once when the plan is finalised, then stop immediately
+- propose_redraft(diagnosis) — call this if you believe the issue itself is wrong, contradicts the codebase, or cannot be sensibly planned as written. Supply a precise diagnosis. The user will choose to continue, discuss, or bail back to the Designer for a redraft. Use this only when the issue itself needs to change — not for ordinary clarifications, which belong to \`questionnaire\`.
 
 Rules:
 - Do not modify any file

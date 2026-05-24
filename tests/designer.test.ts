@@ -1,4 +1,4 @@
-/* 
+/*
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted.
  *
@@ -45,6 +45,7 @@ describe("buildDesignerSystemPrompt", () => {
 			"draft_issue",
 			"draft_subissue",
 			"update_issue",
+			"redraft_issue",
 			"add_comment",
 			"block",
 			"unblock",
@@ -63,21 +64,31 @@ describe("buildDesignerSystemPrompt", () => {
 		expect(prompt).toMatch(/do not close/i);
 	});
 
-	it("references the rebranded /bs-task command, not /bogstandard", () => {
+	it("mentions needs_tests classification", () => {
+		expect(prompt).toContain("needs_tests");
+	});
+
+	it("explains the redraft path out of aborted", () => {
+		expect(prompt).toMatch(/aborted/i);
+		expect(prompt).toMatch(/redraft/i);
+	});
+
+	it("references /bs-task, not /bogstandard", () => {
 		expect(prompt).toContain("/bs-task");
 		expect(prompt).not.toContain("/bogstandard");
 	});
 });
 
 describe("buildDesignerKickoffPrompt", () => {
-	it("notes when there are no open or draft issues", () => {
-		const out = buildDesignerKickoffPrompt([], []);
-		expect(out).toMatch(/no open or draft issues/i);
+	it("notes when the tracker is empty", () => {
+		const out = buildDesignerKickoffPrompt([], [], []);
+		expect(out).toMatch(/no open, draft, or aborted issues|fresh tracker/i);
 	});
 
-	it("renders each open issue with id, priority, and title", () => {
+	it("renders each ready issue with id, priority, and title", () => {
 		const out = buildDesignerKickoffPrompt(
 			[{ id: 7, title: "Add login", priority: "high", parent_id: null }],
+			[],
 			[],
 		);
 		expect(out).toContain("#7");
@@ -89,6 +100,7 @@ describe("buildDesignerKickoffPrompt", () => {
 		const out = buildDesignerKickoffPrompt(
 			[{ id: 12, title: "Form validation", priority: "medium", parent_id: 7 }],
 			[],
+			[],
 		);
 		expect(out).toContain("subissue of #7");
 	});
@@ -97,57 +109,104 @@ describe("buildDesignerKickoffPrompt", () => {
 		const out = buildDesignerKickoffPrompt(
 			[{ id: 3, title: "Open issue", priority: "low", parent_id: null }],
 			[{ id: 5, title: "Draft thing", priority: "high", parent_id: null }],
+			[],
 		);
 		expect(out).toMatch(/pending drafts/i);
 		expect(out).toContain("#5");
 		expect(out).toContain("Draft thing");
 	});
 
+	it("renders aborted issues with their reason", () => {
+		const out = buildDesignerKickoffPrompt(
+			[],
+			[],
+			[
+				{
+					id: 42,
+					title: "Bouncy task",
+					priority: "high",
+					parent_id: null,
+					aborted_reason: "design contradicts existing API",
+				},
+			],
+		);
+		expect(out).toMatch(/aborted/i);
+		expect(out).toContain("#42");
+		expect(out).toContain("design contradicts existing API");
+	});
+
+	it("aborted section omits the reason gracefully when null", () => {
+		const out = buildDesignerKickoffPrompt(
+			[],
+			[],
+			[{ id: 42, title: "Bouncy", priority: "high", parent_id: null, aborted_reason: null }],
+		);
+		expect(out).toContain("#42");
+		expect(out).toContain("Bouncy");
+	});
+
 	it("encourages batching multiple drafts in one turn", () => {
-		const out = buildDesignerKickoffPrompt([], []);
+		const out = buildDesignerKickoffPrompt([], [], []);
 		expect(out).toMatch(/single turn|one turn/i);
 	});
 });
 
 describe("parseDraftEditBuffer", () => {
 	it("parses a valid buffer with all fields", () => {
-		const buf = "title: Fix login bug\npriority: high\n---\nSomething is broken.";
+		const buf = "title: Fix login bug\npriority: high\nneeds_tests: true\n---\nSomething is broken.";
 		const result = parseDraftEditBuffer(buf);
 		expect(result.title).toBe("Fix login bug");
 		expect(result.priority).toBe("high");
+		expect(result.needs_tests).toBe(true);
 		expect(result.description).toBe("Something is broken.");
 	});
 
+	it("accepts needs_tests=false", () => {
+		const buf = "title: Cosmetic tweak\npriority: low\nneeds_tests: false\n---\n";
+		const result = parseDraftEditBuffer(buf);
+		expect(result.needs_tests).toBe(false);
+	});
+
 	it("handles a title containing a colon", () => {
-		const buf = "title: Fix the thing: colon in it\npriority: medium\n---\nDetails.";
+		const buf = "title: Fix the thing: colon in it\npriority: medium\nneeds_tests: true\n---\nDetails.";
 		const result = parseDraftEditBuffer(buf);
 		expect(result.title).toBe("Fix the thing: colon in it");
 	});
 
 	it("accepts an empty description (no text after ---)", () => {
-		const buf = "title: Add feature\npriority: low\n---\n";
+		const buf = "title: Add feature\npriority: low\nneeds_tests: false\n---\n";
 		const result = parseDraftEditBuffer(buf);
 		expect(result.description).toBe("");
 	});
 
 	it("accepts a multi-line description", () => {
-		const buf = "title: Refactor\npriority: critical\n---\nLine one.\n\nLine two.";
+		const buf = "title: Refactor\npriority: critical\nneeds_tests: true\n---\nLine one.\n\nLine two.";
 		const result = parseDraftEditBuffer(buf);
 		expect(result.description).toBe("Line one.\n\nLine two.");
 	});
 
 	it("throws on invalid priority", () => {
-		const buf = "title: Something\npriority: urgent\n---\n";
+		const buf = "title: Something\npriority: urgent\nneeds_tests: true\n---\n";
 		expect(() => parseDraftEditBuffer(buf)).toThrow(/Invalid priority/);
 	});
 
 	it("throws when the --- separator is missing", () => {
-		const buf = "title: Something\npriority: low\nNo separator here.";
+		const buf = "title: Something\npriority: low\nneeds_tests: true\nNo separator here.";
 		expect(() => parseDraftEditBuffer(buf)).toThrow(/Missing --- separator/);
 	});
 
 	it("throws on an empty title", () => {
-		const buf = "title:   \npriority: medium\n---\nSome description.";
+		const buf = "title:   \npriority: medium\nneeds_tests: true\n---\nSome description.";
 		expect(() => parseDraftEditBuffer(buf)).toThrow(/empty title/i);
+	});
+
+	it("throws on missing needs_tests", () => {
+		const buf = "title: Add feature\npriority: low\n---\n";
+		expect(() => parseDraftEditBuffer(buf)).toThrow(/needs_tests/);
+	});
+
+	it("throws on invalid needs_tests value", () => {
+		const buf = "title: Add feature\npriority: low\nneeds_tests: maybe\n---\n";
+		expect(() => parseDraftEditBuffer(buf)).toThrow(/needs_tests/);
 	});
 });

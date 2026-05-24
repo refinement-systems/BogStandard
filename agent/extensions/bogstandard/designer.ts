@@ -1,4 +1,4 @@
-/* 
+/*
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted.
  *
@@ -14,18 +14,11 @@
 /**
  * BogStandard Designer stage.
  *
- * Registers the `/bs-design` command and the Designer tool set. The Designer
- * is a conversational session for brainstorming and creating issues — it
- * does not participate in the planner/implementer phase state machine.
- *
- * Tools are registered once at extension boot; `pi.setActiveTools(...)` in
- * the command handler limits the model to the Designer surface while the
- * session is in design mode.
- *
- * Draft workflow: `draft_issue` / `draft_subissue` create issues with
- * status='draft'. After each agent turn that queued ≥1 draft, the operator
- * reviews them one by one (approve / edit / skip). Skipped drafts are sent
- * back to the agent with operator feedback for revision.
+ * Registers `/bs-design` and the Designer tool set. Conversational; not
+ * coupled to the /bs-task phase machine. Creates issues as version-1 drafts
+ * which the operator reviews after each turn; can also redraft an existing
+ * issue (creates v2+, used to recover an `aborted` issue or revise a `ready`
+ * one).
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -35,15 +28,19 @@ import {
 	configureDb,
 	dependencyAdd,
 	dependencyRemove,
+	getAgentId,
 	issueArchive,
 	issueCreate,
-	issueDraftApprove,
 	issueListFiltered,
+	issuePromoteToReady,
 	issueSetParent,
 	issueShowJson,
 	issueUpdate,
 	issueComment,
+	recentPhaseEvents,
+	redraftIssue,
 	type IssueDetail,
+	type Phase,
 } from "./db.js";
 import { buildDesignerKickoffPrompt, buildDesignerSystemPrompt } from "./designer-prompts.js";
 import { showScrollableMarkdown } from "./scrollable-markdown.js";
@@ -61,6 +58,7 @@ const DESIGN_TOOLS = [
 	"draft_issue",
 	"draft_subissue",
 	"update_issue",
+	"redraft_issue",
 	"add_comment",
 	"block",
 	"unblock",
@@ -73,34 +71,29 @@ const PRIORITY_SCHEMA = Type.Union(
 	{ description: "Priority: low, medium, high, or critical" },
 );
 
-const STATUS_SCHEMA = Type.Union(
+const PHASE_SCHEMA = Type.Union(
 	[
-		Type.Literal("open"),
-		Type.Literal("closed"),
+		Type.Literal("drafting"),
+		Type.Literal("ready"),
+		Type.Literal("planning"),
+		Type.Literal("implementing"),
+		Type.Literal("red_planning"),
+		Type.Literal("red_impl"),
+		Type.Literal("green_planning"),
+		Type.Literal("green_impl"),
+		Type.Literal("done"),
+		Type.Literal("aborted"),
 		Type.Literal("archived"),
-		Type.Literal("draft"),
 	],
-	{ description: "Issue status filter" },
+	{ description: "Issue phase filter" },
 );
 
 export interface RegisterDesignerOptions {
-	/**
-	 * Returns true if the /bs-task state machine is mid-flow. The Designer
-	 * refuses to run while a task is active to keep the active tool set sane.
-	 */
 	isTaskActive: () => boolean;
 }
 
-// ── Registration ─────────────────────────────────────────────────────────────
-
 export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions): void {
-	// Closure flag flipped on by /bs-design and consumed by before_agent_start
-	// to swap in the Designer system prompt. Not persisted across sessions —
-	// re-run /bs-design after `pi -r` to reactivate.
 	let designerActive = false;
-
-	// IDs of drafts created during the current agent turn. Consumed and cleared
-	// by the agent_end handler that shows the review UI.
 	let pendingDraftIds: number[] = [];
 
 	registerDesignerTools(pi, () => pendingDraftIds);
@@ -132,21 +125,42 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 				return;
 			}
 
-			let openIssues: Array<{ id: number; title: string; priority?: string; parent_id: number | null }> = [];
+			let readyIssues: Array<{ id: number; title: string; priority?: string; parent_id: number | null }> = [];
 			let draftIssues: Array<{ id: number; title: string; priority?: string; parent_id: number | null }> = [];
+			let abortedRaw: Array<{ id: number; title: string; priority?: string; parent_id: number | null }> = [];
 			try {
-				openIssues = await issueListFiltered(pi, { status: "open" });
-				draftIssues = await issueListFiltered(pi, { status: "draft" });
+				readyIssues = await issueListFiltered(pi, { phase: "ready" });
+				draftIssues = await issueListFiltered(pi, { phase: "drafting" });
+				abortedRaw = await issueListFiltered(pi, { phase: "aborted" });
 			} catch (err) {
 				ctx.ui.notify(`Failed to list issues: ${err}`, "error");
 				return;
+			}
+
+			const abortedIssues: Array<{
+				id: number;
+				title: string;
+				priority?: string;
+				parent_id: number | null;
+				aborted_reason?: string | null;
+			}> = [];
+			for (const ai of abortedRaw) {
+				let reason: string | null = null;
+				try {
+					const events = await recentPhaseEvents(pi, ai.id, 5);
+					const abortEv = events.find((e) => e.phase_to === "aborted");
+					reason = abortEv?.reason ?? null;
+				} catch {
+					// non-fatal: just don't surface the reason
+				}
+				abortedIssues.push({ ...ai, aborted_reason: reason });
 			}
 
 			designerActive = true;
 			pendingDraftIds = [];
 			pi.setActiveTools(DESIGN_TOOLS);
 
-			const kickoff = buildDesignerKickoffPrompt(openIssues, draftIssues);
+			const kickoff = buildDesignerKickoffPrompt(readyIssues, draftIssues, abortedIssues);
 			pi.sendMessage(
 				{ customType: "bs-design-kickoff", content: kickoff, display: false },
 				{ triggerTurn: true, deliverAs: "followUp" },
@@ -170,6 +184,7 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 
 	async function runDraftReviewLoop(ctx: ExtensionContext, ids: number[]): Promise<void> {
 		const skippedIds: number[] = [];
+		const agentId = await getAgentId(pi);
 
 		for (const id of ids) {
 			let issue: IssueDetail;
@@ -195,7 +210,7 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 
 				if (action === "approve") {
 					try {
-						await issueDraftApprove(pi, id);
+						await issuePromoteToReady(pi, id, agentId);
 					} catch (err) {
 						ctx.ui.notify(`Failed to approve draft #${id}: ${err}`, "error");
 					}
@@ -204,12 +219,10 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 					skippedIds.push(id);
 					resolved = true;
 				} else {
-					// edit: open editor with current content, loop until valid parse or cancel
-					let parsed: { title: string; priority: string; description: string } | null = null;
+					let parsed: { title: string; priority: string; needs_tests: boolean; description: string } | null = null;
 					while (parsed === null) {
 						const buffer = await ctx.ui.editor("Edit draft:", formatDraftForEdit(issue));
 						if (buffer === undefined) {
-							// User cancelled the editor — leave as draft
 							skippedIds.push(id);
 							resolved = true;
 							break;
@@ -218,7 +231,6 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 							parsed = parseDraftEditBuffer(buffer);
 						} catch (err) {
 							ctx.ui.notify(`Invalid format: ${err instanceof Error ? err.message : String(err)}`, "error");
-							// loop: re-open editor
 						}
 					}
 					if (parsed !== null) {
@@ -227,6 +239,7 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 								title: parsed.title,
 								description: parsed.description,
 								priority: parsed.priority,
+								needs_tests: parsed.needs_tests,
 							});
 							issue = await issueShowJson(pi, id);
 						} catch (err) {
@@ -234,7 +247,6 @@ export function registerDesigner(pi: ExtensionAPI, opts: RegisterDesignerOptions
 							skippedIds.push(id);
 							resolved = true;
 						}
-						// outer while continues: show the updated draft for approve/edit/skip
 					}
 				}
 			}
@@ -261,9 +273,9 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 		name: "list_issues",
 		label: "List Issues",
 		description:
-			"List existing issues with optional filters. Defaults to listing all open and draft issues. Use this to understand what already exists before proposing new issues.",
+			"List existing issues with optional filters. Defaults to listing all drafting and ready issues. Use this to understand what already exists before proposing new issues. Pass phase='aborted' to see issues that need redrafting.",
 		parameters: Type.Object({
-			status: Type.Optional(STATUS_SCHEMA),
+			phase: Type.Optional(PHASE_SCHEMA),
 			priority: Type.Optional(PRIORITY_SCHEMA),
 			parent_id: Type.Optional(
 				Type.Union([Type.Number(), Type.Null()], {
@@ -273,7 +285,7 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 		}),
 		async execute(_id, params) {
 			const issues = await issueListFiltered(pi, {
-				status: params.status,
+				phase: params.phase as Phase | undefined,
 				priority: params.priority,
 				parent_id: params.parent_id,
 			});
@@ -282,7 +294,7 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 			}
 			const lines = issues.map(
 				(i) =>
-					`#${i.id} ${i.priority} ${i.status}${i.parent_id ? ` (subissue of #${i.parent_id})` : ""} — ${i.title}`,
+					`#${i.id} ${i.priority} ${i.phase}${i.parent_id ? ` (subissue of #${i.parent_id})` : ""} — ${i.title}`,
 			);
 			return { content: [{ type: "text" as const, text: lines.join("\n") }] };
 		},
@@ -292,12 +304,15 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 		name: "show_issue",
 		label: "Show Issue",
 		description:
-			"Fetch full detail for one issue: description, comments, subissues, and blockers. Use to read context before refining or linking.",
+			"Fetch full detail for one issue: current version's title/description/needs_tests, comments scoped to the current version, subissues, and blockers. Pass include_history=true to also fetch all prior versions and their comments — use this before redrafting.",
 		parameters: Type.Object({
 			id: Type.Number({ description: "Issue id" }),
+			include_history: Type.Optional(
+				Type.Boolean({ description: "Include all prior versions and their comments" }),
+			),
 		}),
 		async execute(_id, params) {
-			const issue = await issueShowJson(pi, params.id);
+			const issue = await issueShowJson(pi, params.id, { include_history: params.include_history === true });
 			return { content: [{ type: "text" as const, text: JSON.stringify(issue, null, 2) }] };
 		},
 	});
@@ -313,6 +328,10 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 				Type.String({ description: "Markdown describing the problem and what success looks like" }),
 			),
 			priority: PRIORITY_SCHEMA,
+			needs_tests: Type.Boolean({
+				description:
+					"True if this issue should be implemented via red/green TDD (write failing tests first). False for purely structural, cosmetic, or operational changes that don't warrant test-first.",
+			}),
 			block_on: Type.Optional(
 				Type.Array(Type.Number(), {
 					description: "Issue ids that must be resolved before this one can start",
@@ -324,7 +343,7 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 				title: params.title,
 				description: params.description,
 				priority: params.priority,
-				status: "draft",
+				needs_tests: params.needs_tests,
 			});
 			for (const blockerId of params.block_on ?? []) {
 				await dependencyAdd(pi, newId, blockerId);
@@ -334,9 +353,10 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 				params.block_on && params.block_on.length > 0
 					? `, blocked by [${params.block_on.join(", ")}]`
 					: "";
+			const testsMsg = params.needs_tests ? "TDD" : "no-tests";
 			return {
 				content: [
-					{ type: "text" as const, text: `Queued draft #${newId} (${params.priority})${blockMsg}` },
+					{ type: "text" as const, text: `Queued draft #${newId} (${params.priority}, ${testsMsg})${blockMsg}` },
 				],
 			};
 		},
@@ -352,6 +372,7 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 			title: Type.String(),
 			description: Type.Optional(Type.String()),
 			priority: PRIORITY_SCHEMA,
+			needs_tests: Type.Boolean(),
 			block_on: Type.Optional(Type.Array(Type.Number())),
 		}),
 		async execute(_id, params) {
@@ -360,17 +381,18 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 				description: params.description,
 				priority: params.priority,
 				parent_id: params.parent_id,
-				status: "draft",
+				needs_tests: params.needs_tests,
 			});
 			for (const blockerId of params.block_on ?? []) {
 				await dependencyAdd(pi, newId, blockerId);
 			}
 			getPendingDraftIds().push(newId);
+			const testsMsg = params.needs_tests ? "TDD" : "no-tests";
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: `Queued draft subissue #${newId} under #${params.parent_id} (${params.priority})`,
+						text: `Queued draft subissue #${newId} under #${params.parent_id} (${params.priority}, ${testsMsg})`,
 					},
 				],
 			};
@@ -380,32 +402,76 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 	pi.registerTool({
 		name: "update_issue",
 		label: "Update Issue",
-		description: "Refine an existing issue's title, description, or priority. Pass only the fields you want to change.",
+		description:
+			"Refine an existing issue. Title, description, and needs_tests can only be changed while the issue is in 'drafting' phase. Priority can be changed any time.",
 		parameters: Type.Object({
 			id: Type.Number(),
 			title: Type.Optional(Type.String()),
 			description: Type.Optional(Type.String()),
 			priority: Type.Optional(PRIORITY_SCHEMA),
+			needs_tests: Type.Optional(Type.Boolean()),
 		}),
 		async execute(_id, params) {
 			await issueUpdate(pi, params.id, {
 				title: params.title,
 				description: params.description,
 				priority: params.priority,
+				needs_tests: params.needs_tests,
 			});
 			const changed: string[] = [];
 			if (params.title !== undefined) changed.push("title");
 			if (params.description !== undefined) changed.push("description");
 			if (params.priority !== undefined) changed.push("priority");
+			if (params.needs_tests !== undefined) changed.push("needs_tests");
 			const summary = changed.length ? changed.join(", ") : "(no changes)";
 			return { content: [{ type: "text" as const, text: `Updated #${params.id}: ${summary}` }] };
 		},
 	});
 
 	pi.registerTool({
+		name: "redraft_issue",
+		label: "Redraft Issue",
+		description:
+			"Produce a new version of an existing issue. Allowed only when phase is drafting, ready, or aborted. Use this to recover an 'aborted' issue (the only way out of that state) or to substantially revise a 'ready' issue. The new version starts with a clean comment history; carry_forward_summary becomes the first comment on it. Read the prior version first with show_issue(id, include_history=true) so you can write an accurate summary.",
+		parameters: Type.Object({
+			id: Type.Number(),
+			title: Type.String(),
+			description: Type.String(),
+			needs_tests: Type.Boolean(),
+			carry_forward_summary: Type.String({
+				description:
+					"What was retained from the prior version, what was changed, and why. Becomes the first comment on the new version.",
+			}),
+		}),
+		async execute(_id, params) {
+			const agentId = await getAgentId(pi);
+			const result = await redraftIssue(
+				pi,
+				params.id,
+				{
+					title: params.title,
+					description: params.description,
+					needs_tests: params.needs_tests,
+					carry_forward_summary: params.carry_forward_summary,
+				},
+				agentId,
+			);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `Redrafted #${params.id} as v${result.version_no}. Phase reset to 'ready'.`,
+					},
+				],
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "add_comment",
 		label: "Add Comment",
-		description: "Append a note comment to an existing issue. Use when context is worth recording but doesn't change the title/description.",
+		description:
+			"Append a note to an existing issue. The comment is scoped to the issue's current version — if the issue is later redrafted, this comment stays attached to the version it was written against.",
 		parameters: Type.Object({
 			id: Type.Number(),
 			content: Type.String(),
@@ -419,7 +485,8 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 	pi.registerTool({
 		name: "block",
 		label: "Block",
-		description: "Record that one open issue blocks another. The blocked issue will not be eligible for /bs-task auto-pick until the blocker closes.",
+		description:
+			"Record that one open issue blocks another. The blocked issue will not be eligible for /bs-task auto-pick until the blocker closes.",
 		parameters: Type.Object({
 			blocked_id: Type.Number({ description: "The issue that is blocked" }),
 			blocker_id: Type.Number({ description: "The issue that must close first" }),
@@ -475,7 +542,8 @@ function registerDesignerTools(pi: ExtensionAPI, getPendingDraftIds: () => numbe
 			id: Type.Number(),
 		}),
 		async execute(_id, params) {
-			await issueArchive(pi, params.id);
+			const agentId = await getAgentId(pi);
+			await issueArchive(pi, params.id, agentId);
 			return { content: [{ type: "text" as const, text: `Archived #${params.id}` }] };
 		},
 	});

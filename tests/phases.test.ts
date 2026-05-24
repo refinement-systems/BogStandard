@@ -1,4 +1,4 @@
-/* 
+/*
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted.
  *
@@ -11,251 +11,128 @@
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-import { describe, expect, it, vi } from "vitest";
-import type { IssueComment, IssueDetail } from "../agent/extensions/bogstandard/db.js";
-import type { BogstandardPhaseEntry, BogstandardState } from "../agent/extensions/bogstandard/phases.js";
-import { buildBsHeader, loadState, reconstructState, saveState } from "../agent/extensions/bogstandard/phases.js";
+import { describe, expect, it } from "vitest";
+import type { Phase, PhaseEvent } from "../agent/extensions/bogstandard/db.js";
+import {
+	IDLE_STATE,
+	isActive,
+	isMidWorkPhase,
+	reconstructFromEvents,
+} from "../agent/extensions/bogstandard/phases.js";
 
-function makeCtx(entries: unknown[]) {
-	return { sessionManager: { getEntries: () => entries } };
+let nextId = 1000;
+
+function ev(
+	phaseTo: Phase,
+	overrides: Partial<PhaseEvent> = {},
+): PhaseEvent {
+	return {
+		id: nextId--,
+		issue_id: 1,
+		version_id: 1,
+		phase_from: null,
+		phase_to: phaseTo,
+		agent_id: null,
+		reason: null,
+		metadata: null,
+		created_at: new Date().toISOString(),
+		...overrides,
+	};
 }
 
-function makeEntry(data: BogstandardPhaseEntry) {
-	return { type: "custom", customType: "bs-task-phase", data };
-}
+describe("isMidWorkPhase", () => {
+	it.each<Phase>(["planning", "implementing", "red_planning", "red_impl", "green_planning", "green_impl"])(
+		"%s is mid-work",
+		(p) => {
+			expect(isMidWorkPhase(p)).toBe(true);
+		},
+	);
 
-describe("loadState", () => {
-	it("returns idle when entries array is empty", () => {
-		expect(loadState(makeCtx([]) as any)).toEqual({ phase: "idle" });
-	});
+	it.each<Phase>(["drafting", "ready", "done", "aborted", "archived"])(
+		"%s is not mid-work",
+		(p) => {
+			expect(isMidWorkPhase(p)).toBe(false);
+		},
+	);
 
-	it("returns the single bs-task-phase entry", () => {
-		const ctx = makeCtx([makeEntry({ phase: "planning", issueId: 42 })]);
-		expect(loadState(ctx as any)).toEqual({ phase: "planning", issueId: 42 });
-	});
-
-	it("returns the LAST of multiple bs-task-phase entries", () => {
-		const ctx = makeCtx([
-			makeEntry({ phase: "planning", issueId: 42 }),
-			makeEntry({ phase: "reviewing-plan", issueId: 42, plan: "my plan" }),
-		]);
-		const state = loadState(ctx as any);
-		expect(state.phase).toBe("reviewing-plan");
-		expect(state.plan).toBe("my plan");
-	});
-
-	it("ignores entries of other custom types", () => {
-		const ctx = makeCtx([
-			{ type: "custom", customType: "other-type", data: { phase: "planning" } },
-			{ type: "message", role: "user", content: "hello" },
-		]);
-		expect(loadState(ctx as any)).toEqual({ phase: "idle" });
-	});
-
-	it("ignores entries with null data", () => {
-		const ctx = makeCtx([{ type: "custom", customType: "bs-task-phase", data: null }]);
-		expect(loadState(ctx as any)).toEqual({ phase: "idle" });
-	});
-
-	it("ignores entries where data.phase is not a string", () => {
-		const ctx = makeCtx([
-			{ type: "custom", customType: "bs-task-phase", data: { phase: 99 } },
-		]);
-		expect(loadState(ctx as any)).toEqual({ phase: "idle" });
-	});
-
-	it("restores all optional TDD fields", () => {
-		const entry: BogstandardPhaseEntry = {
-			phase: "implementing-green",
-			issueId: 7,
-			plan: "green plan",
-			redDiff: "diff --git a/x.ts ...",
-			bailReason: "tests impossible",
-		};
-		const ctx = makeCtx([makeEntry(entry)]);
-		expect(loadState(ctx as any)).toEqual({
-			phase: "implementing-green",
-			issueId: 7,
-			plan: "green plan",
-			redDiff: "diff --git a/x.ts ...",
-			bailReason: "tests impossible",
-		});
+	it("undefined is not mid-work", () => {
+		expect(isMidWorkPhase(undefined)).toBe(false);
 	});
 });
 
-describe("saveState", () => {
-	function capturePi() {
-		const calls: Array<{ type: string; data: any }> = [];
-		return {
-			pi: { appendEntry: (type: string, data: unknown) => calls.push({ type, data }) },
-			calls,
-		};
-	}
-
-	it("calls appendEntry with 'bs-task-phase' type", () => {
-		const { pi, calls } = capturePi();
-		saveState(pi as any, { phase: "planning", issueId: 1 });
-		expect(calls).toHaveLength(1);
-		expect(calls[0].type).toBe("bs-task-phase");
+describe("isActive", () => {
+	it("idle state is not active", () => {
+		expect(isActive(IDLE_STATE)).toBe(false);
 	});
 
-	it("persists phase and issueId", () => {
-		const { pi, calls } = capturePi();
-		saveState(pi as any, { phase: "implementing-red", issueId: 99 });
-		expect(calls[0].data.phase).toBe("implementing-red");
-		expect(calls[0].data.issueId).toBe(99);
+	it("state with issueId + planning phase is active", () => {
+		expect(isActive({ ...IDLE_STATE, issueId: 1, phase: "planning" })).toBe(true);
 	});
 
-	it("persists optional TDD fields when present", () => {
-		const { pi, calls } = capturePi();
-		const state: BogstandardState = {
-			phase: "implementing-green",
-			issueId: 1,
-			plan: "the plan",
-			redDiff: "the diff",
-			bailReason: "bad tests",
-		};
-		saveState(pi as any, state);
-		const { data } = calls[0];
-		expect(data.plan).toBe("the plan");
-		expect(data.redDiff).toBe("the diff");
-		expect(data.bailReason).toBe("bad tests");
+	it("done is not active", () => {
+		expect(isActive({ ...IDLE_STATE, issueId: 1, phase: "done" })).toBe(false);
 	});
 
-	it("writes undefined for absent optional fields (no phantom data)", () => {
-		const { pi, calls } = capturePi();
-		saveState(pi as any, { phase: "done", issueId: 5 });
-		const { data } = calls[0];
-		expect(data.plan).toBeUndefined();
-		expect(data.redDiff).toBeUndefined();
-		expect(data.bailReason).toBeUndefined();
+	it("aborted is not active", () => {
+		expect(isActive({ ...IDLE_STATE, issueId: 1, phase: "aborted" })).toBe(false);
 	});
 });
 
-// ── reconstructState ─────────────────────────────────────────────────────────
-
-function makeComment(event: string, attrs: Record<string, string> = {}, body = ""): IssueComment {
-	const header = buildBsHeader(event, attrs);
-	return { kind: "result", content: body ? `${header}\n\n${body}` : header };
-}
-
-function makeIssue(comments: IssueComment[]): IssueDetail {
-	return { id: 1, title: "test issue", status: "open", comments };
-}
-
-describe("reconstructState", () => {
-	it("returns idle when there are no comments", async () => {
-		expect(await reconstructState(makeIssue([]))).toEqual({ phase: "idle" });
-	});
-
-	it("returns idle when comments have no BogStandard headers", async () => {
-		const issue = makeIssue([{ kind: "human", content: "just a comment" }]);
-		expect(await reconstructState(issue)).toEqual({ phase: "idle" });
-	});
-
-	it("path-chosen no-tests → planning", async () => {
-		const issue = makeIssue([makeComment("path-chosen", { path: "no-tests" })]);
-		expect(await reconstructState(issue)).toEqual({ phase: "planning", issueId: 1 });
-	});
-
-	it("path-chosen tdd → planning-red", async () => {
-		const issue = makeIssue([makeComment("path-chosen", { path: "tdd" })]);
-		expect(await reconstructState(issue)).toEqual({ phase: "planning-red", issueId: 1 });
-	});
-
-	it("plan-accepted planning → implementing with plan body", async () => {
-		const issue = makeIssue([makeComment("plan-accepted", { phase: "planning" }, "## the plan")]);
-		const state = await reconstructState(issue);
-		expect(state.phase).toBe("implementing");
+describe("reconstructFromEvents", () => {
+	it("returns base state when there are no events", () => {
+		const state = reconstructFromEvents("planning", 1, 5, []);
 		expect(state.issueId).toBe(1);
-		expect(state.plan).toBe("## the plan");
-	});
-
-	it("plan-accepted planning-red → implementing-red with plan body", async () => {
-		const issue = makeIssue([makeComment("plan-accepted", { phase: "planning-red" }, "red plan")]);
-		const state = await reconstructState(issue);
-		expect(state.phase).toBe("implementing-red");
-		expect(state.plan).toBe("red plan");
-	});
-
-	it("red-commit → planning-green, calls gitShow with sha", async () => {
-		const gitShow = vi.fn().mockResolvedValue("diff content");
-		const issue = makeIssue([makeComment("red-commit", { sha: "abc123" })]);
-		const state = await reconstructState(issue, gitShow);
-		expect(state.phase).toBe("planning-green");
-		expect(state.issueId).toBe(1);
-		expect(state.redDiff).toBe("diff content");
-		expect(gitShow).toHaveBeenCalledWith("abc123");
-	});
-
-	it("red-commit without gitShow → planning-green with undefined redDiff", async () => {
-		const issue = makeIssue([makeComment("red-commit", { sha: "abc123" })]);
-		const state = await reconstructState(issue);
-		expect(state.phase).toBe("planning-green");
+		expect(state.phase).toBe("planning");
+		expect(state.versionId).toBe(5);
+		expect(state.plan).toBeUndefined();
 		expect(state.redDiff).toBeUndefined();
 	});
 
-	it("plan-accepted planning-green → implementing-green with plan and redDiff", async () => {
-		const gitShow = vi.fn().mockResolvedValue("red diff");
-		const issue = makeIssue([
-			makeComment("red-commit", { sha: "deadbeef" }),
-			makeComment("plan-accepted", { phase: "planning-green" }, "green plan"),
-		]);
-		const state = await reconstructState(issue, gitShow);
-		expect(state.phase).toBe("implementing-green");
+	it("restores plan from the most recent transition-into-implementing event", () => {
+		const events: PhaseEvent[] = [
+			ev("implementing", { metadata: { plan: "my plan" } }),
+		];
+		const state = reconstructFromEvents("implementing", 1, 5, events);
+		expect(state.plan).toBe("my plan");
+	});
+
+	it("restores plan for red_impl from a transition-into-red_impl event", () => {
+		const events: PhaseEvent[] = [ev("red_impl", { metadata: { plan: "red plan" } })];
+		const state = reconstructFromEvents("red_impl", 1, 5, events);
+		expect(state.plan).toBe("red plan");
+	});
+
+	it("restores plan + redDiff for green_impl", () => {
+		const events: PhaseEvent[] = [
+			ev("green_impl", { metadata: { plan: "green plan" } }),
+			ev("green_planning", { metadata: { red_sha: "abc1234", red_diff: "diff body" } }),
+		];
+		const state = reconstructFromEvents("green_impl", 1, 5, events);
 		expect(state.plan).toBe("green plan");
-		expect(state.redDiff).toBe("red diff");
-		expect(gitShow).toHaveBeenCalledWith("deadbeef");
+		expect(state.redDiff).toBe("diff body");
 	});
 
-	it("green-bail after plan-accepted planning-green → planning-red (bail resets)", async () => {
-		const issue = makeIssue([
-			makeComment("plan-accepted", { phase: "planning-green" }, "green plan"),
-			makeComment("green-bail"),
-		]);
-		const state = await reconstructState(issue);
-		expect(state.phase).toBe("planning-red");
+	it("captures bail_sha when current phase is red_planning", () => {
+		const events: PhaseEvent[] = [
+			ev("red_planning", { metadata: { bail_sha: "deadbeef", reason: "bail" } }),
+		];
+		const state = reconstructFromEvents("red_planning", 1, 5, events);
+		expect(state.bailRedSha).toBe("deadbeef");
+	});
+
+	it("does not pick up bail_sha when current phase is not red_planning", () => {
+		const events: PhaseEvent[] = [
+			ev("red_planning", { metadata: { bail_sha: "deadbeef" } }),
+		];
+		const state = reconstructFromEvents("planning", 1, 5, events);
+		expect(state.bailRedSha).toBeUndefined();
+	});
+
+	it("does not restore plan from an event for a different phase", () => {
+		const events: PhaseEvent[] = [
+			ev("red_impl", { metadata: { plan: "red plan, not for green" } }),
+		];
+		const state = reconstructFromEvents("green_impl", 1, 5, events);
 		expect(state.plan).toBeUndefined();
-		expect(state.bailRedSha).toBeUndefined(); // no red-commit in comments
-	});
-
-	it("green-bail with preceding red-commit → planning-red with bailRedSha for git cleanup", async () => {
-		const issue = makeIssue([
-			makeComment("red-commit", { sha: "abc1234" }),
-			makeComment("plan-accepted", { phase: "planning-green" }, "green plan"),
-			makeComment("green-bail"),
-		]);
-		const state = await reconstructState(issue);
-		expect(state.phase).toBe("planning-red");
-		expect(state.bailRedSha).toBe("abc1234");
-		expect(state.plan).toBeUndefined();
-	});
-
-	it("final-commit → done", async () => {
-		const issue = makeIssue([makeComment("final-commit", { sha: "abc" })]);
-		expect(await reconstructState(issue)).toEqual({ phase: "done", issueId: 1 });
-	});
-
-	it("closed → done", async () => {
-		const issue = makeIssue([makeComment("closed")]);
-		expect(await reconstructState(issue)).toEqual({ phase: "done", issueId: 1 });
-	});
-
-	it("last plan-accepted wins when multiple exist", async () => {
-		const issue = makeIssue([
-			makeComment("plan-accepted", { phase: "planning" }, "first plan"),
-			makeComment("plan-accepted", { phase: "planning" }, "second plan"),
-		]);
-		const state = await reconstructState(issue);
-		expect(state.plan).toBe("second plan");
-	});
-
-	it("gitShow throwing → redDiff is a non-empty placeholder string, no crash", async () => {
-		const gitShow = vi.fn().mockRejectedValue(new Error("git not available"));
-		const issue = makeIssue([makeComment("red-commit", { sha: "abc" })]);
-		const state = await reconstructState(issue, gitShow);
-		expect(state.phase).toBe("planning-green");
-		expect(typeof state.redDiff).toBe("string");
-		expect(state.redDiff!.length).toBeGreaterThan(0);
 	});
 });

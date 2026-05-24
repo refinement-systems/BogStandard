@@ -124,23 +124,47 @@ async function assertTargetEmpty(client: pg.Client, force: boolean): Promise<voi
 	}
 }
 
-async function migrateIssues(client: pg.Client, rows: ChainlinkIssue[]): Promise<void> {
-	if (rows.length === 0) return;
+function chainlinkStatusToPhase(s: string): string {
+	switch (s) {
+		case "open":     return "ready";
+		case "draft":    return "drafting";
+		case "closed":   return "done";
+		case "archived": return "archived";
+		default:         return "ready";
+	}
+}
+
+async function migrateIssues(
+	client: pg.Client,
+	rows: ChainlinkIssue[],
+): Promise<Map<number, number>> {
+	const issueIdToVersionId = new Map<number, number>();
+	if (rows.length === 0) return issueIdToVersionId;
 	// Two passes so parent_id FKs always resolve: first NULL parents, then patch.
 	for (const r of rows) {
 		await client.query(
-			`INSERT INTO issues (id, title, description, status, priority, parent_id, created_at, updated_at, closed_at)
-			      VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8)`,
+			`INSERT INTO issues (id, phase, priority, parent_id, created_at, updated_at, closed_at)
+			      VALUES ($1, $2, $3, NULL, $4, $5, $6)`,
 			[
 				r.id,
-				r.title,
-				r.description,
-				r.status,
+				chainlinkStatusToPhase(r.status),
 				r.priority,
 				r.created_at,
 				r.updated_at,
 				r.closed_at,
 			],
+		);
+		const versionRes = await client.query<{ id: string }>(
+			`INSERT INTO issue_versions (issue_id, version_no, title, description, needs_tests, created_at)
+			      VALUES ($1, 1, $2, $3, NULL, $4)
+			   RETURNING id`,
+			[r.id, r.title, r.description, r.created_at],
+		);
+		const versionId = Number(versionRes.rows[0].id);
+		issueIdToVersionId.set(r.id, versionId);
+		await client.query(
+			`UPDATE issues SET current_version_id = $1 WHERE id = $2`,
+			[versionId, r.id],
 		);
 	}
 	for (const r of rows) {
@@ -155,14 +179,25 @@ async function migrateIssues(client: pg.Client, rows: ChainlinkIssue[]): Promise
 		`SELECT setval('issues_id_seq', (SELECT COALESCE(MAX(id), 1) FROM issues))`,
 	);
 	console.log(`  issues       : ${rows.length}`);
+	console.log(`  versions     : ${issueIdToVersionId.size}`);
+	return issueIdToVersionId;
 }
 
-async function migrateComments(client: pg.Client, rows: ChainlinkComment[]): Promise<void> {
+async function migrateComments(
+	client: pg.Client,
+	rows: ChainlinkComment[],
+	issueIdToVersionId: Map<number, number>,
+): Promise<void> {
 	for (const r of rows) {
+		const versionId = issueIdToVersionId.get(r.issue_id);
+		if (versionId === undefined) {
+			console.warn(`  comment #${r.id} skipped: issue #${r.issue_id} not imported`);
+			continue;
+		}
 		await client.query(
-			`INSERT INTO comments (id, issue_id, kind, content, created_at)
-			      VALUES ($1, $2, $3, $4, $5)`,
-			[r.id, r.issue_id, r.kind ?? "note", r.content, r.created_at],
+			`INSERT INTO comments (id, issue_id, version_id, kind, content, created_at)
+			      VALUES ($1, $2, $3, $4, $5, $6)`,
+			[r.id, r.issue_id, versionId, r.kind ?? "note", r.content, r.created_at],
 		);
 	}
 	if (rows.length > 0) {
@@ -248,8 +283,8 @@ async function main(): Promise<void> {
 		await assertTargetEmpty(client, args.force);
 		await client.query("BEGIN");
 		try {
-			await migrateIssues(client, issues);
-			await migrateComments(client, comments);
+			const issueIdToVersionId = await migrateIssues(client, issues);
+			await migrateComments(client, comments, issueIdToVersionId);
 			await migrateDeps(client, deps);
 			await migrateAgentJson(client, resolve(projectRoot, args.agentJson));
 			await client.query("COMMIT");

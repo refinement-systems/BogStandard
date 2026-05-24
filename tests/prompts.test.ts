@@ -28,7 +28,10 @@ import {
 const ISSUE: IssueDetail = {
 	id: 42,
 	title: "Implement feature X",
-	status: "open",
+	phase: "ready",
+	current_version_id: 1,
+	current_version_no: 1,
+	needs_tests: false,
 	description: "We need feature X.",
 	comments: [{ kind: "human", content: "Please keep it simple." }],
 };
@@ -168,6 +171,10 @@ describe("buildPlannerSystemPrompt", () => {
 
 	it("describes the save_plan tool", () => {
 		expect(buildPlannerSystemPrompt()).toContain("save_plan");
+	});
+
+	it("describes the propose_redraft tool", () => {
+		expect(buildPlannerSystemPrompt()).toContain("propose_redraft");
 	});
 
 	it("prohibits file modification", () => {
