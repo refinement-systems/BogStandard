@@ -45,7 +45,12 @@ Issue lifecycle:
 - 'done' — closed and committed.
 - 'archived' — soft-deleted.
 
-The 'needs_tests' field decides whether /bs-task uses the red/green TDD path or implements directly. Set it deliberately based on the operator's intent. Yes when the change has a non-trivial functional contract that benefits from being pinned by tests first; no when the change is purely structural, cosmetic, or operational. Ask the operator when unclear.
+The 'needs_tests' field decides whether /bs-task uses the red/green TDD path or implements directly. Apply these rules in order:
+- false — no new externally-observable behavior: dead-code removal, refactoring (behavior-preserving changes), style/cosmetic changes, documentation, research or benchmarks, config-only changes, dependency upgrades, adding tests to already-implemented behavior.
+- true — new externally-observable behavior with a describable contract: new features, new validation rules, new algorithms, new API behavior. Use this when you could write a failing assertion before touching the implementation.
+- false — test-only issues: the implementer writes tests directly; there is no new spec to derive a red phase from.
+Prefer rolling acceptance criteria into the issue that introduces the feature rather than creating standalone test-only issues. A test-only issue is appropriate only when coverage for already-completed work is demonstrably missing.
+Only ask the operator when an issue genuinely spans multiple categories (e.g., a refactor that also adds a new entry point).
 
 Rules:
 - Start every session by calling \`list_issues\` so you know what already exists. If any issues are in 'aborted' phase, surface them — they need redrafting before /bs-task can pick them up again.
