@@ -166,8 +166,6 @@ Runs unit tests covering the pure-logic modules:
 - `phases.ts` (interrupt) — `endReason` session stop-reason detection
 - `scroll-math.ts` — scrollable-markdown viewer offset/page clamping
 
-SQL-touching paths (the eligibility query against a real database, lock claim/release/steal, comment insertion, issue close) are exercised manually via end-to-end smoke runs; the unit suite uses stub runners and pure helpers.
-
 ## Project structure
 
 ```
