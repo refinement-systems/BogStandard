@@ -2,6 +2,8 @@
 
 The swamp level of agent orchestrators.
 
+It's all very WIP and changes daily, don't use it yet.
+
 Inspiration stolen shamelessly from:
 * [chainlink](https://github.com/dollspace-gay/chainlink)
 * [exomonad](https://github.com/tidepool-heavy-industries/exomonad)
@@ -15,8 +17,6 @@ BogStandard is a pi extension and an orchestrator script.
   * `/bs-task` drives issue review, planning (with interactive refinement), optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
   * `/bs-design` opens a conversational Designer session for brainstorming and seeding new issues into the database (create, update, block, subissue, archive — but not close, since that belongs to `/bs-task`).
 * The script runs multiple sessions in parallel, picking the appropriate issues.
-
-NOTE: while the extension is okay-ish, the dispatch.sh is very WIP and should not be used for any valuable projects.
 
 ## Requirements
 
