@@ -90,7 +90,7 @@ function printHelp(): void {
 }
 
 /** Split a postgres URL into (adminUrl, dbName). */
-function splitDatabaseUrl(url: string): { adminUrl: string; dbName: string } {
+export function splitDatabaseUrl(url: string): { adminUrl: string; dbName: string } {
 	const u = new URL(url);
 	const dbName = u.pathname.replace(/^\//, "");
 	if (!dbName) {
@@ -100,7 +100,7 @@ function splitDatabaseUrl(url: string): { adminUrl: string; dbName: string } {
 	return { adminUrl: u.toString(), dbName };
 }
 
-async function databaseExists(adminUrl: string, dbName: string): Promise<boolean> {
+export async function databaseExists(adminUrl: string, dbName: string): Promise<boolean> {
 	const client = new Client({ connectionString: adminUrl });
 	await client.connect();
 	try {
@@ -114,7 +114,7 @@ async function databaseExists(adminUrl: string, dbName: string): Promise<boolean
 	}
 }
 
-async function createDatabase(adminUrl: string, dbName: string): Promise<void> {
+export async function createDatabase(adminUrl: string, dbName: string): Promise<void> {
 	const client = new Client({ connectionString: adminUrl });
 	await client.connect();
 	try {
@@ -130,9 +130,9 @@ async function createDatabase(adminUrl: string, dbName: string): Promise<void> {
 	}
 }
 
-function writeConfig(
+export function writeConfig(
 	projectRoot: string,
-	args: Required<Pick<Args, "databaseUrl">> & Pick<Args, "agentId" | "staleLockTimeoutMinutes">,
+	args: { databaseUrl: string; agentId?: string; staleLockTimeoutMinutes?: number },
 	force: boolean,
 ): string {
 	const dir = resolve(projectRoot, ".bogstandard");
@@ -200,7 +200,11 @@ function reportError(err: unknown): void {
 	console.error(e?.stack ?? err);
 }
 
-main().catch((err) => {
-	reportError(err);
-	process.exit(1);
-});
+// Run main() only when this file is the entry point — importing the module
+// (e.g. from tests) should not execute the CLI flow.
+if (import.meta.url === `file://${process.argv[1]}`) {
+	main().catch((err) => {
+		reportError(err);
+		process.exit(1);
+	});
+}

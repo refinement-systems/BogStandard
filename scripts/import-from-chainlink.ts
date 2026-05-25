@@ -87,7 +87,7 @@ function parseArgs(argv: string[]): Args {
 	return out;
 }
 
-interface ChainlinkIssue {
+export interface ChainlinkIssue {
 	id: number;
 	title: string;
 	description: string | null;
@@ -99,7 +99,7 @@ interface ChainlinkIssue {
 	closed_at: string | null;
 }
 
-interface ChainlinkComment {
+export interface ChainlinkComment {
 	id: number;
 	issue_id: number;
 	content: string;
@@ -107,12 +107,12 @@ interface ChainlinkComment {
 	kind: string | null;
 }
 
-interface ChainlinkDep {
+export interface ChainlinkDep {
 	blocker_id: number;
 	blocked_id: number;
 }
 
-async function assertTargetEmpty(client: pg.Client, force: boolean): Promise<void> {
+export async function assertTargetEmpty(client: pg.Client, force: boolean): Promise<void> {
 	const tables = ["issues", "comments", "dependencies"];
 	for (const t of tables) {
 		const res = await client.query<{ count: string }>(`SELECT count(*)::text AS count FROM ${t}`);
@@ -125,7 +125,7 @@ async function assertTargetEmpty(client: pg.Client, force: boolean): Promise<voi
 	}
 }
 
-function chainlinkStatusToPhase(s: string): string {
+export function chainlinkStatusToPhase(s: string): string {
 	switch (s) {
 		case "open":     return "ready";
 		case "draft":    return "drafting";
@@ -135,7 +135,7 @@ function chainlinkStatusToPhase(s: string): string {
 	}
 }
 
-async function migrateIssues(
+export async function migrateIssues(
 	client: pg.Client,
 	rows: ChainlinkIssue[],
 ): Promise<Map<number, number>> {
@@ -192,7 +192,7 @@ async function migrateIssues(
 	return issueIdToVersionId;
 }
 
-async function migrateComments(
+export async function migrateComments(
 	client: pg.Client,
 	rows: ChainlinkComment[],
 	issueIdToVersionId: Map<number, number>,
@@ -217,7 +217,7 @@ async function migrateComments(
 	console.log(`  comments     : ${rows.length}`);
 }
 
-async function migrateDeps(client: pg.Client, rows: ChainlinkDep[]): Promise<void> {
+export async function migrateDeps(client: pg.Client, rows: ChainlinkDep[]): Promise<void> {
 	for (const r of rows) {
 		await client.query(
 			`INSERT INTO dependencies (blocker_id, blocked_id) VALUES ($1, $2)
@@ -234,7 +234,7 @@ async function migrateDeps(client: pg.Client, rows: ChainlinkDep[]): Promise<voi
  * `dependencyAdd`'s per-edge guard and writes both the chainlink dependency
  * rows and any converted parent_id edges directly.
  */
-async function assertNoCycles(client: pg.Client): Promise<void> {
+export async function assertNoCycles(client: pg.Client): Promise<void> {
 	const res = await client.query<{ path: Array<string | number> | null }>(FIND_CYCLE_SQL);
 	const path = res.rows[0]?.path;
 	if (path && path.length > 0) {
@@ -245,7 +245,7 @@ async function assertNoCycles(client: pg.Client): Promise<void> {
 	}
 }
 
-async function migrateAgentJson(client: pg.Client, agentJsonPath: string): Promise<void> {
+export async function migrateAgentJson(client: pg.Client, agentJsonPath: string): Promise<void> {
 	if (!existsSync(agentJsonPath)) {
 		console.log(`  agent_config : (no ${agentJsonPath} found, skipping)`);
 		return;
@@ -326,18 +326,20 @@ async function main(): Promise<void> {
 	console.log("\nImport complete.");
 }
 
-main().catch((err) => {
-	const e = err as { code?: string; message?: string; stack?: string } | undefined;
-	console.error("bs-import failed:");
-	if (e?.code === "ECONNREFUSED") {
-		console.error(
-			"  Connection refused — is your postgres server running and reachable?\n" +
-				"  Try: pg_isready -h <host> -p <port>",
-		);
-	} else if (e?.message && e.message.trim() !== "") {
-		console.error(`  ${e.message}`);
-	} else {
-		console.error(e?.stack ?? err);
-	}
-	process.exit(1);
-});
+if (import.meta.url === `file://${process.argv[1]}`) {
+	main().catch((err) => {
+		const e = err as { code?: string; message?: string; stack?: string } | undefined;
+		console.error("bs-import failed:");
+		if (e?.code === "ECONNREFUSED") {
+			console.error(
+				"  Connection refused — is your postgres server running and reachable?\n" +
+					"  Try: pg_isready -h <host> -p <port>",
+			);
+		} else if (e?.message && e.message.trim() !== "") {
+			console.error(`  ${e.message}`);
+		} else {
+			console.error(e?.stack ?? err);
+		}
+		process.exit(1);
+	});
+}

@@ -70,7 +70,7 @@ function parseArgs(argv: string[]): Args {
 	return out;
 }
 
-async function assertDatabaseExists(url: string): Promise<void> {
+export async function assertDatabaseExists(url: string): Promise<void> {
 	const client = new Client({ connectionString: url });
 	try {
 		await client.connect();
@@ -105,7 +105,8 @@ async function main(): Promise<void> {
 	console.log("\nMigrations up to date.");
 }
 
-main().catch((err) => {
+if (import.meta.url === `file://${process.argv[1]}`) {
+	main().catch((err) => {
 	const e = err as { code?: string; message?: string; stack?: string } | undefined;
 	console.error("bs-migrate failed:");
 	if (e?.code === "ECONNREFUSED") {
@@ -120,3 +121,4 @@ main().catch((err) => {
 	}
 	process.exit(1);
 });
+}

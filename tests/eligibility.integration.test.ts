@@ -118,4 +118,23 @@ describe.skipIf(!isPostgresAvailable())("ELIGIBLE_SQL", () => {
 		const ids = (await listEligible(pi, 60)).map((r) => r.id);
 		expect(ids).toEqual([critId, highId, medId1, medId2, lowId]);
 	});
+
+	it("owner-set but phase_started_at NULL is still claimed (NULL < interval is NULL, not true)", async () => {
+		// In Read Committed Postgres, `NULL < now() - interval` evaluates to NULL,
+		// which is filtered out by the WHERE clause. So an issue with an agent
+		// id set but no heartbeat is treated as freshly claimed and excluded.
+		const id = await makeReady("orphan-claim");
+		await getPool().query(
+			`UPDATE issues SET current_agent_id = 'ghost', phase_started_at = NULL WHERE id = $1`,
+			[id],
+		);
+		const ids = (await listEligible(pi, 60)).map((r) => r.id);
+		expect(ids).not.toContain(id);
+	});
+
+	// Note: the priority `ELSE 4` branch (issue-picker.ts ELIGIBLE_SQL) is
+	// unreachable here because the issues.priority CHECK constraint rejects
+	// any value outside ('low', 'medium', 'high', 'critical'). The ELSE 4
+	// arm is dead code in the current schema; if the CHECK ever loosens,
+	// add an integration test that inserts an issue with the new priority.
 });
