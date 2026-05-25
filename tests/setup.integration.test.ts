@@ -79,6 +79,10 @@ describe("writeConfig", () => {
 			database_url: "postgres://localhost/foo",
 			agent_id: "alpha",
 			stale_lock_timeout_minutes: 30,
+			merge: {
+				test_command: ["npm", "test"],
+				test_timeout_seconds: 600,
+			},
 		});
 	});
 
@@ -88,6 +92,16 @@ describe("writeConfig", () => {
 		const parsed = JSON.parse(readFileSync(path, "utf8"));
 		expect(parsed.agent_id).toBe("main");
 		expect(parsed.stale_lock_timeout_minutes).toBe(60);
+	});
+
+	it("seeds the merge block with a placeholder test_command and default timeout", () => {
+		const projectRoot = mkdtempSync(join(tmp, "p-"));
+		const path = writeConfig(projectRoot, { databaseUrl: "postgres://localhost/foo" }, false);
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		expect(parsed.merge).toEqual({
+			test_command: ["npm", "test"],
+			test_timeout_seconds: 600,
+		});
 	});
 
 	it("refuses to overwrite an existing config without force", () => {

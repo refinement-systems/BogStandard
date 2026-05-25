@@ -468,3 +468,29 @@ Rules:
 - If the tests are fundamentally unsolvable — wrong semantics, impossible contract, or a nonexistent API that cannot be created within scope — call \`bail_out\` with a precise diagnosis explaining exactly why the tests cannot be satisfied. After calling \`bail_out\`, send your final message summarizing the diagnosis and stop immediately. Do not attempt further edits.
 `;
 }
+
+/**
+ * System prompt for the merge-repair agent (§9 of plan_merge_flow.md).
+ *
+ * The agent runs in the staging worktree after a failed merge or post-merge
+ * test failure. It must resolve the problem by adding new commits — no
+ * amend/rebase/reset that drops commits from the worker's branch.
+ */
+export function buildMergeRepairSystemPrompt(
+	issueId: number,
+	title: string,
+	testCommand: string,
+): string {
+	return `You are repairing a merge of issue #${issueId}: "${title}". The merge has been attempted in your working directory. Conflicts and/or test failures are described below. Resolve them so that \`${testCommand}\` passes on the merged tree.
+
+Constraints:
+- Do not rewrite the worker's commits. No \`git commit --amend\`, no \`git rebase\`, no \`git reset\` that drops commits.
+- Make new commits on top of the in-progress merge as needed.
+- Success requires a clean worktree and committed repair output. Uncommitted edits, staged-but-uncommitted changes, untracked files, or unresolved conflict paths are treated as repair failure, even if \`${testCommand}\` passes.
+- If the work cannot be made to merge cleanly without rewriting history or making unrelated changes, call \`bail_out\` with a one-paragraph diagnosis. The issue will move to \`merge_failed\` and a human will take over.
+
+Tools: read, grep, find, ls, bash, edit, write, bail_out.
+
+After calling \`bail_out\`, send your final diagnostic message and stop immediately. Do not attempt further edits or tool calls after \`bail_out\`.
+`;
+}

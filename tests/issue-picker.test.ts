@@ -16,10 +16,12 @@ import type { IssueListEntry, Phase } from "../agent/extensions/bogstandard/db.j
 import {
 	ELIGIBLE_SQL,
 	FIND_CYCLE_SQL,
+	PENDING_MERGES_SQL,
 	findBlockCycleWith,
 	type QueryRunner,
 	formatIssueLabel,
 	listEligibleWith,
+	listPendingMergesWith,
 } from "../agent/extensions/bogstandard/issue-picker.js";
 
 interface Row {
@@ -120,6 +122,39 @@ describe("FIND_CYCLE_SQL", () => {
 	it("starts every walk from each issue and looks for a self-revisit", () => {
 		expect(FIND_CYCLE_SQL).toMatch(/FROM issues/);
 		expect(FIND_CYCLE_SQL).toMatch(/d\.blocked_id = w\.start_id/);
+	});
+});
+
+describe("listPendingMergesWith", () => {
+	it("uses the canonical pending-merge SQL", async () => {
+		const runner = runnerReturning([]);
+		await listPendingMergesWith(runner);
+		expect(runner.lastSql).toBe(PENDING_MERGES_SQL);
+		expect(runner.lastParams).toBeUndefined();
+	});
+
+	it("pending merge SQL covers all merge phases", () => {
+		expect(PENDING_MERGES_SQL).toMatch(/'merging_pending'/);
+		expect(PENDING_MERGES_SQL).toMatch(/'merging'/);
+		expect(PENDING_MERGES_SQL).toMatch(/'merge_repair'/);
+		expect(PENDING_MERGES_SQL).toMatch(/'merge_failed'/);
+	});
+
+	it("maps ids to numbers and preserves phases", async () => {
+		const runner: QueryRunner = {
+			async query<R extends Record<string, unknown>>() {
+				return {
+					rows: [
+						{ id: "7", phase: "merging_pending" },
+						{ id: 8, phase: "merge_failed" },
+					] as unknown as R[],
+				};
+			},
+		};
+		expect(await listPendingMergesWith(runner)).toEqual([
+			{ id: 7, phase: "merging_pending" },
+			{ id: 8, phase: "merge_failed" },
+		]);
 	});
 });
 

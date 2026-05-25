@@ -8,7 +8,8 @@
     "test:watch": "vitest",
     "setup": "tsx scripts/setup.ts",
     "migrate": "tsx scripts/migrate.ts",
-    "import": "tsx scripts/import-from-chainlink.ts"
+    "import": "tsx scripts/import-from-chainlink.ts",
+    "merge-worker": "tsx scripts/run-merge-worker.ts"
   },
   "dependencies": {
     "node-pg-migrate": "^7.9.1",

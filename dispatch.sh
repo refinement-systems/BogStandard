@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+
+# Permission to use, copy, modify, and/or distribute this software for
+# any purpose with or without fee is hereby granted.
+#
+# THE SOFTWARE IS PROVIDED “AS IS” AND THE AUTHOR DISCLAIMS ALL
+# WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE
+# FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY
+# DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+# AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+# OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 # dispatch.sh — spawn N parallel BogStandard workers, one per eligible issue.
 #
 # Usage:
@@ -169,6 +181,8 @@ EOF
 done <<< "$ISSUES"
 
 echo "Spawned $((i - 1)) worker(s) in tmux session '${SESSION}'."
+echo "Workers publish issue refs and queue merges; run 'bs-merge-worker' from the"
+echo "main repo to land them (the multi-worker counterpart to bs-run's second phase)."
 echo "Detach with Ctrl-b d.  When done: ./dispatch.sh --cleanup"
 if [[ -n "${TMUX:-}" ]]; then
     tmux switch-client -t "$SESSION"

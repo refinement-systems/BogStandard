@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+# Permission to use, copy, modify, and/or distribute this software for
+# any purpose with or without fee is hereby granted.
+#
+# THE SOFTWARE IS PROVIDED “AS IS” AND THE AUTHOR DISCLAIMS ALL
+# WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE
+# FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY
+# DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+# AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+# OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# bs-merge-worker — long-running daemon that processes the bogstandard_merge
+# queue for the BogStandard postgres database configured for the current
+# directory's project. With --once, claim at most one task and exit.
+set -euo pipefail
+BS_PROJECT_ROOT="$(pwd)"
+BS_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export BS_PROJECT_ROOT
+if [[ ! -x "${BS_HOME}/node_modules/.bin/tsx" ]]; then
+    echo "error: BogStandard dependencies are not installed." >&2
+    echo "Run 'npm install' inside ${BS_HOME} first." >&2
+    exit 1
+fi
+# Make pi's runtime packages resolvable. They ship inside the global
+# @earendil-works/pi-coding-agent install, not on the public npm registry.
+NPM_GLOBAL_ROOT="$(npm root -g 2>/dev/null)"
+PI_ROOT="${NPM_GLOBAL_ROOT}/@earendil-works/pi-coding-agent"
+PI_NM="${PI_ROOT}/node_modules"
+NODE_PATH_PARTS=()
+if [[ -d "$NPM_GLOBAL_ROOT" ]]; then
+    NODE_PATH_PARTS+=("$NPM_GLOBAL_ROOT")
+fi
+if [[ -d "$PI_ROOT" ]]; then
+    export PI_CODING_AGENT_ROOT="$PI_ROOT"
+    NODE_PATH_PARTS+=("$PI_ROOT")
+fi
+if [[ -d "$PI_NM" ]]; then
+    NODE_PATH_PARTS+=("$PI_NM")
+fi
+if [[ ${#NODE_PATH_PARTS[@]} -gt 0 ]]; then
+    OLD_IFS="$IFS"
+    IFS=:
+    NODE_PATH_PREFIX="${NODE_PATH_PARTS[*]}"
+    IFS="$OLD_IFS"
+    export NODE_PATH="${NODE_PATH_PREFIX}${NODE_PATH:+:$NODE_PATH}"
+fi
+exec "${BS_HOME}/node_modules/.bin/tsx" "${BS_HOME}/scripts/run-merge-worker.ts" "$@"

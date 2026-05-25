@@ -4,6 +4,12 @@ The swamp level of agent orchestrators.
 
 It's all very WIP and changes daily, don't use it yet.
 
+# Licensing
+
+0BSD. Do whatever you want with it.
+
+# Prior art
+
 Inspiration stolen shamelessly from:
 * [chainlink](https://github.com/dollspace-gay/chainlink)
 * [exomonad](https://github.com/tidepool-heavy-industries/exomonad)
@@ -11,12 +17,14 @@ Inspiration stolen shamelessly from:
 
 # Structure
 
-BogStandard is a pi extension and an orchestrator script.
+BogStandard is an agent orchestrator built around two durable roles:
 
-* The extension automates a two-phase `plan → implement` loop for issues stored in a managed Postgres database. It runs as a [pi](https://github.com/earendil-works/pi) extension exposing two commands:
-  * `/bs-task` drives issue review, planning (with interactive refinement), optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
-  * `/bs-design` opens a conversational Designer session for brainstorming and seeding new issues into the database (create, update, block, unblock, archive — but not close, since that belongs to `/bs-task`).
-* The script runs multiple sessions in parallel, picking the appropriate issues.
+* **worker** — runs `/bs-task` (a [pi](https://github.com/earendil-works/pi) extension command) to plan and implement one issue, then publishes the result for merge. Workers do not land changes on `main` themselves.
+* **merger** — runs `bs-merge-worker` to validate queued work and land it on `main`, transitioning the issue to `done`.
+
+A separate `/bs-design` command on the same extension opens a conversational Designer session for filling and grooming the backlog (create, update, block, unblock, archive — but not close, since closing belongs to the merger).
+
+The normal one-issue flow is `bs-run` — a thin wrapper that runs one worker task in pi (with auto-shutdown at terminal boundaries) and then runs the merge worker once. For multiple parallel workers, use `dispatch.sh` to launch workers and run a long-lived `bs-merge-worker` alongside.
 
 ## Requirements
 
@@ -75,24 +83,31 @@ The extension and scripts read `.bogstandard/config.json` for the postgres conne
 
 ## Usage
 
-Run from inside a project that has been set up:
+Run from inside a project that has been set up. The `bs-run` wrapper is the normal "work one issue" entry point — it runs the worker until it reaches a terminal boundary, then lands any queued merge:
 
 ```bash
-# Brainstorm and create new issues with the Designer
+bs-run                                                 # next eligible issue
+bs-run 42                                              # explicit issue id
+bs-run -- --bs-plan-model openrouter/deepseek/deepseek-v4-flash
+bs-run 42 -- --bs-impl-model anthropic/claude-sonnet-4-6
+```
+
+Brainstorm new issues with the Designer:
+
+```bash
 pi -e /path/to/BogStandard/agent/extensions/bogstandard /bs-design
-
-# Auto-pick the next eligible open issue
-pi -e /path/to/BogStandard/agent/extensions/bogstandard /bs-task
-
-# Explicit issue number
-pi -e /path/to/BogStandard/agent/extensions/bogstandard /bs-task 42
 ```
 
-If you're running from the repo root, use a relative path:
+### Advanced (debugging): direct `/bs-task`
+
+For interactive use without the auto-shutdown / auto-merge wrapper:
 
 ```bash
-pi -e ./agent/extensions/bogstandard /bs-task
+pi -e /path/to/BogStandard/agent/extensions/bogstandard /bs-task        # auto-pick
+pi -e /path/to/BogStandard/agent/extensions/bogstandard /bs-task 42     # explicit id
 ```
+
+Workers run this way stay in interactive pi when the task finishes, and the merge worker is not invoked. Use this when you want to keep the session alive for follow-up commands, or run `bs-merge-worker --once` separately to land queued work.
 
 ### Designer (`/bs-design`)
 
@@ -142,6 +157,7 @@ pi -e ./agent/extensions/bogstandard \
 | `--bs-red-impl-model` | Red-phase implementer only |
 | `--bs-green-plan-model` | Green-phase planner only |
 | `--bs-green-impl-model` | Green-phase implementer only |
+| `--bs-merge-repair-model` | Merge repair agent only (falls back to `--bs-impl-model`) |
 
 Flag format: `provider/model-id`. For OpenRouter models use `openrouter/` as prefix: `openrouter/deepseek/deepseek-v4-flash`. Set `OPENROUTER_API_KEY` in your environment so pi can authenticate.
 
@@ -171,6 +187,20 @@ Prereqs: `bs-setup` has already been run in this repo (so `.bogstandard/config.j
 Anything after `--` is forwarded verbatim to every `pi` invocation. The dispatcher reads eligible issue ids via `bs-list-eligible` and pre-assigns one to each worker with `--bs-issue-id`, so workers don't race on auto-pick.
 
 Workers run inside a tmux session named `bogstandard-dispatch-<pid>`. Detach with `Ctrl-b d`, re-attach with `tmux attach -t bogstandard-dispatch-<pid>`. When you're done, `./dispatch.sh --cleanup` removes the `bogstandard/worker-*` branches and their worktrees.
+
+## Merge worker
+
+`bs-merge-worker` lands completed issue refs through the detached `.bogstandard/merge-staging` worktree. During finalization it advances `refs/heads/main`, records the issue as `done`, and deletes the issue handoff ref.
+
+If a merge conflict or post-merge test failure needs agent repair, the daemon uses the repair model passed in the handoff task from `/bs-task` (`--bs-merge-repair-model`, falling back to `--bs-impl-model`). For manually enqueued or retried merge tasks without params, set `"merge.repair_model": "provider/model-id"` in `.bogstandard/config.json`. There is no built-in default repair model.
+
+If another worktree has `main` checked out, Git leaves that checkout's files and index at the old tree when the daemon advances the branch ref. The merge worker now syncs those attached `main` checkouts automatically only when it can prove they are safe:
+
+- clean attached `main` checkouts are reset to the new `refs/heads/main` and left with empty `git status`;
+- dirty attached `main` checkouts block finalization before `refs/heads/main` moves;
+- changes or untracked files that appear during finalization are not overwritten, and the worker exits with an actionable error.
+
+Fix the dirty checkout by committing, stashing, or removing the local changes, then restart `bs-merge-worker`. The staging worktree remains the only place where merges and repair-agent edits happen.
 
 ## Inspecting the database
 

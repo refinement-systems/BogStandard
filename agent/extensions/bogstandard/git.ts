@@ -96,3 +96,72 @@ export async function currentBranch(pi: ExtensionAPI, signal?: AbortSignal): Pro
 		return undefined;
 	}
 }
+
+export async function headSha(pi: ExtensionAPI, signal?: AbortSignal): Promise<string> {
+	const { stdout } = await run(pi, ["rev-parse", "HEAD"], { signal });
+	return stdout.trim();
+}
+
+export async function gitMergeBase(
+	pi: ExtensionAPI,
+	a: string,
+	b: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	const { stdout } = await run(pi, ["merge-base", a, b], { signal });
+	return stdout.trim();
+}
+
+export async function gitRevListCount(
+	pi: ExtensionAPI,
+	range: string,
+	signal?: AbortSignal,
+): Promise<number> {
+	const { stdout } = await run(pi, ["rev-list", "--count", range], { signal });
+	return Number.parseInt(stdout.trim(), 10);
+}
+
+export async function gitUpdateRef(
+	pi: ExtensionAPI,
+	refName: string,
+	sha: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	await run(pi, ["update-ref", refName, sha], { signal });
+}
+
+export async function gitDeleteRef(
+	pi: ExtensionAPI,
+	refName: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	await run(pi, ["update-ref", "-d", refName], { signal });
+}
+
+export async function gitRefExists(
+	pi: ExtensionAPI,
+	refName: string,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const { code } = await run(pi, ["show-ref", "--verify", "--quiet", refName], {
+		signal,
+		allowNonZero: true,
+	});
+	return code === 0;
+}
+
+export async function gitBranchDelete(
+	pi: ExtensionAPI,
+	branch: string,
+	force = true,
+	signal?: AbortSignal,
+): Promise<void> {
+	await run(pi, ["branch", force ? "-D" : "-d", branch], { signal });
+}
+
+export async function gitCheckoutDetachHead(
+	pi: ExtensionAPI,
+	signal?: AbortSignal,
+): Promise<void> {
+	await run(pi, ["checkout", "--detach", "HEAD"], { signal });
+}

@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+
+# Permission to use, copy, modify, and/or distribute this software for
+# any purpose with or without fee is hereby granted.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+# WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE
+# FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY
+# DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+# AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+# OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# bs-run — single-shot orchestrator. Runs one /bs-task in pi, then runs the
+# merge worker once. After the worker reaches a terminal /bs-task boundary,
+# the extension calls ctx.shutdown() (triggered by --bs-single-shot) and pi
+# exits; we then invoke bs-merge-worker --once to land any queued merge.
+#
+# Usage:
+#   bs-run                                 # next eligible issue, default models
+#   bs-run 42                              # work issue #42
+#   bs-run -- --bs-plan-model foo/bar      # forward flags to pi
+#   bs-run 42 -- --bs-impl-model foo/bar
+set -euo pipefail
+
+BS_PROJECT_ROOT="$(pwd)"
+BS_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export BS_PROJECT_ROOT
+
+if ! command -v pi >/dev/null 2>&1; then
+    echo "error: pi is not on PATH. Install @earendil-works/pi-coding-agent." >&2
+    exit 1
+fi
+if [[ ! -x "${BS_HOME}/node_modules/.bin/tsx" ]]; then
+    echo "error: BogStandard dependencies are not installed." >&2
+    echo "Run 'npm install' inside ${BS_HOME} first." >&2
+    exit 1
+fi
+
+# Parse: optional numeric issue id, then "--" then pi args.
+ISSUE_ID=""
+PI_ARGS=()
+if [[ ${1-} =~ ^[0-9]+$ ]]; then
+    ISSUE_ID="$1"
+    shift
+fi
+if [[ ${1-} == "--" ]]; then
+    shift
+    PI_ARGS=("$@")
+elif [[ $# -gt 0 ]]; then
+    echo "error: unexpected argument(s): $*" >&2
+    echo "usage: bs-run [issue-id] [-- pi-args...]" >&2
+    exit 2
+fi
+
+EXT="${BS_HOME}/agent/extensions/bogstandard"
+PI_CMD=(pi -e "$EXT" --bs-single-shot)
+if [[ ${#PI_ARGS[@]} -gt 0 ]]; then
+    PI_CMD+=("${PI_ARGS[@]}")
+fi
+PI_CMD+=(/bs-task)
+if [[ -n "$ISSUE_ID" ]]; then
+    PI_CMD+=("$ISSUE_ID")
+fi
+
+set +e
+"${PI_CMD[@]}"
+PI_RC=$?
+set -e
+if (( PI_RC != 0 )); then
+    exit "$PI_RC"
+fi
+
+exec "${BS_HOME}/bin/bs-merge-worker" --once

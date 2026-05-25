@@ -1,9 +1,13 @@
 # BogStandard
 
-BogStandard automates a two-phase plan→implement loop for issues tracked in a managed Postgres database. It runs as a [pi](https://github.com/earendil-works/pi) extension exposing two commands:
+BogStandard is an agent orchestrator built around two durable roles:
 
-- `/bs-task` drives the full plan→implement flow — issue review, planning, optional TDD red/green cycle, implementation, issue close, and git commit — all within one pi session.
-- `/bs-design` opens a separate conversational Designer session for brainstorming and creating new issues (create, update, comment, block, unblock, archive). The Designer never closes issues; closing belongs to `/bs-task`.
+- **worker** — runs `/bs-task`, plans and implements one issue, then publishes the result for merge. Workers do not land changes on `main` themselves.
+- **merger** — `bs-merge-worker`, validates queued work and lands it on `main`, transitioning the issue to `done`.
+
+Issues live in a managed Postgres database. A [pi](https://github.com/earendil-works/pi) extension exposes the worker role via `/bs-task`, plus a conversational Designer (`/bs-design`) for brainstorming and creating new issues (create, update, comment, block, unblock, archive). The Designer never closes issues; closing belongs to the merger.
+
+The normal one-issue flow is `bs-run` — a thin wrapper that runs one worker task in pi (with auto-shutdown at terminal boundaries) and then runs the merge worker once. For multiple parallel workers, use `dispatch.sh` plus a separate long-running `bs-merge-worker`.
 
 ## One-time setup
 
@@ -57,17 +61,21 @@ This runs `node-pg-migrate` against the configured database, recording applied m
 
 ## Running the workflow
 
-Load the extension with `-e` and invoke either command:
+The single-shot wrapper is the normal "work one issue" entry point:
 
 ```bash
-# Brainstorm and create new issues
+bs-run                                                # next eligible issue
+bs-run 42                                             # explicit issue id
+bs-run -- --bs-plan-model openrouter/deepseek/deepseek-v4-flash
+bs-run 42 -- --bs-impl-model anthropic/claude-sonnet-4-6
+```
+
+`bs-run` runs `/bs-task` inside an interactive pi session with `--bs-single-shot` set. When the worker reaches a terminal boundary (work queued for merge, issue closed without changes, no eligible issue, user abort, etc.) the extension calls `ctx.shutdown()` and pi exits; the wrapper then runs `bs-merge-worker --once` to land any queued merge.
+
+Brainstorm issues via the Designer:
+
+```bash
 pi -e ./agent/extensions/bogstandard /bs-design
-
-# Auto-pick the next eligible open issue and work it end-to-end
-pi -e ./agent/extensions/bogstandard /bs-task
-
-# Explicit issue number
-pi -e ./agent/extensions/bogstandard /bs-task 42
 ```
 
 **`/bs-design`** runs a conversational Designer agent with a tool surface limited to issue CRUD: `list_issues`, `show_issue`, `draft_issue`, `update_issue`, `redraft_issue`, `add_comment`, `block`, `unblock`, `archive`. It is stateless across pi sessions — re-run any time to continue brainstorming. The Designer does not modify source files, run git, or close issues.
@@ -78,7 +86,16 @@ Issue hierarchy is expressed entirely through the block graph (`dependencies`): 
 
 **`/bs-task` with an explicit issue id** skips the auto-pick and goes straight to review for that issue.
 
-Both `/bs-task` paths end with closing the issue (`UPDATE issues SET status='closed'`) and creating a git commit. Closing an issue no longer touches CHANGELOG.md — only the git commit message reflects the change.
+`/bs-task` worker completion does **not** close changed issues directly: it commits to a worker branch, publishes `refs/bogstandard/issue-<id>`, records the handoff in `issue_branches`, transitions the issue to `merging_pending`, and enqueues a merge task. The merger closes issues by transitioning merge phases to `done` after a clean test run on `main`. The no-change path (no files changed) still transitions directly to `done` because there is nothing to merge.
+
+For interactive debugging without auto-merge, call `/bs-task` directly:
+
+```bash
+pi -e ./agent/extensions/bogstandard /bs-task
+pi -e ./agent/extensions/bogstandard /bs-task 42
+```
+
+Workers run this way stay in interactive pi when the task finishes; you can run another command in the same session.
 
 ### Planning and plan review
 
@@ -174,19 +191,27 @@ bin/
   bs-migrate                   # Wrapper: apply pending schema migrations
   bs-import                    # Wrapper: one-shot chainlink → postgres data import
   bs-list-eligible             # Wrapper: print eligible issue ids for the caller's cwd
+  bs-merge-worker              # Wrapper: run the merge daemon against the configured DB
+  bs-run                       # Single-shot orchestrator: one worker task, then one merge run
 db/
   migrations/
     0001_init.sql              # Initial postgres schema
     0002_draft_status.sql      # Add 'draft' to issues.status check constraint
     0003_phase_state_and_versioning.sql  # Issue-centric phase machine + issue_versions
     0004_drop_parent_id.sql    # Collapse parent_id into dependencies; verify acyclic
+    0005_merge_phases.sql      # Merge-flow phases + issue_branches handoff table
+    0006_merge_queue.sql       # merge_tasks + merge_task_steps for the merge daemon
 scripts/
   setup.ts                     # Create DB if missing, apply schema, write config.json
   migrate.ts                   # Apply pending node-pg-migrate migrations
   import-from-chainlink.ts     # Copy issues/comments/dependencies from .chainlink/issues.db
   list-eligible.ts             # Print eligible issue ids (used by dispatch.sh)
+  run-merge-worker.ts          # bs-merge-worker daemon: claim, run, finalize merges
   lib/
     migrations.ts              # Shared node-pg-migrate runner used by setup.ts + migrate.ts
+    merge-runtime.ts           # Daemon-side queue runtime: runOnce/runDaemon + step replay
+    merge-worker.ts             # Staging worktree + merge config helpers
+    agent-runner.ts            # Shared agent loop wrapper used by run-merge-worker
 agent/
   extensions/
     bogstandard/               # The pi extension (TypeScript)
@@ -197,11 +222,14 @@ agent/
       db.ts                      # Postgres adapter (issue CRUD, ownership, dependencies + CYCLE_CHECK_SQL guard)
       git.ts                     # Typed wrappers over pi.exec("git", ...)
       issue-picker.ts            # Eligibility query, FIND_CYCLE_SQL, findBlockCycle diagnostic, label formatting
+      merge-handoff.ts           # Worker → daemon handoff (issue_branches + enqueueMergeTask)
+      merge-queue.ts             # Schema-touching helpers for merge_tasks (enqueue, row types)
       phases.ts                  # /bs-task phase state types, loadState / saveState
-      prompts.ts                 # All six /bs-task prompt builders (inline content, no temp files)
+      prompts.ts                 # All /bs-task + merge prompt builders (inline content, no temp files)
       questionnaire.ts           # Questionnaire tool for plan-phase clarifying questions
       scrollable-markdown.ts     # ScrollableMarkdownView component used by issue + plan review
       scroll-math.ts             # Pure scroll-offset helpers (testable without pi runtime)
+      single-shot.ts             # Pure shouldShutdownInSingleShot helper used by --bs-single-shot
 reference/                     # Not tracked; open-source reference code
 draft/                         # Not checked out; implementation reference snippets
 tests/
@@ -215,6 +243,8 @@ tests/
   scroll-math.test.ts            # Unit tests for scroll-offset helpers
   designer.test.ts               # Unit tests for assertPriority + Designer prompt builders
   dependency-cycle.test.ts       # Unit tests for CYCLE_CHECK_SQL shape
+  single-shot.test.ts            # Unit tests for shouldShutdownInSingleShot
+  bs-run.test.ts                 # Integration tests for bin/bs-run with fake pi + merger
 package.json                   # vitest + pg + better-sqlite3 + tsx
 dispatch.sh                    # Multi-worker dispatcher (postgres-backed)
 vitest.config.ts

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+# Permission to use, copy, modify, and/or distribute this software for
+# any purpose with or without fee is hereby granted.
+#
+# THE SOFTWARE IS PROVIDED “AS IS” AND THE AUTHOR DISCLAIMS ALL
+# WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE
+# FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY
+# DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+# AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+# OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# bs-setup — run BogStandard's setup script against the current directory.
+#
+# Use this from any project directory (it does not need its own package.json).
+# The target project's .bogstandard/config.json will be written here; the
+# schema and tsx runtime come from BogStandard's own checkout.
+set -euo pipefail
+BS_PROJECT_ROOT="$(pwd)"
+BS_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export BS_PROJECT_ROOT
+if [[ ! -x "${BS_HOME}/node_modules/.bin/tsx" ]]; then
+    echo "error: BogStandard dependencies are not installed." >&2
+    echo "Run 'npm install' inside ${BS_HOME} first." >&2
+    exit 1
+fi
+exec "${BS_HOME}/node_modules/.bin/tsx" "${BS_HOME}/scripts/setup.ts" "$@"

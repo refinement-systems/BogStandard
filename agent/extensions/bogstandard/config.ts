@@ -30,17 +30,47 @@ import { resolve } from "node:path";
 
 export const DEFAULT_AGENT_ID = "main";
 export const DEFAULT_STALE_LOCK_TIMEOUT_MINUTES = 60;
+export const DEFAULT_MERGE_STAGING_WORKTREE = ".bogstandard/merge-staging";
+export const DEFAULT_MERGE_TEST_TIMEOUT_SECONDS = 600;
+
+/**
+ * Merge-flow configuration. Consumed by `bs-merge-worker`; the rest of the
+ * stack only carries it through. All fields are optional in the file so
+ * non-merge callers don't need to construct one; the daemon enforces
+ * `test_command` presence at startup.
+ */
+export interface MergeFileConfig {
+	test_command?: string[];
+	test_timeout_seconds?: number;
+	staging_worktree?: string;
+	repair_model?: string;
+}
+
+export interface MergeConfig {
+	/** Undefined if the file's `merge` block omitted `test_command`. Daemon asserts. */
+	testCommand?: string[];
+	testTimeoutSeconds: number;
+	stagingWorktree: string;
+	repairModel?: string;
+}
 
 export interface FileConfig {
 	database_url?: string;
 	agent_id?: string;
 	stale_lock_timeout_minutes?: number;
+	merge?: MergeFileConfig;
 }
 
 export interface ResolvedConfig {
 	databaseUrl: string;
 	agentId: string;
 	staleLockTimeoutMinutes: number;
+	/**
+	 * Optional at the type level so non-merge callers (the orchestrator, the
+	 * Designer, setup) don't need to construct one in tests. `bs-merge-worker`
+	 * asserts presence (and a non-empty test_command) at startup.
+	 */
+	merge?: MergeConfig;
 }
 
 export interface ConfigSources {
@@ -72,7 +102,16 @@ export function resolveConfig(sources: ConfigSources): ResolvedConfig {
 	const staleLockTimeoutMinutes =
 		file.stale_lock_timeout_minutes ?? DEFAULT_STALE_LOCK_TIMEOUT_MINUTES;
 
-	return { databaseUrl, agentId, staleLockTimeoutMinutes };
+	const resolved: ResolvedConfig = { databaseUrl, agentId, staleLockTimeoutMinutes };
+	if (file.merge !== undefined) {
+		resolved.merge = {
+			testCommand: file.merge.test_command,
+			testTimeoutSeconds: file.merge.test_timeout_seconds ?? DEFAULT_MERGE_TEST_TIMEOUT_SECONDS,
+			stagingWorktree: file.merge.staging_worktree ?? DEFAULT_MERGE_STAGING_WORKTREE,
+			repairModel: file.merge.repair_model,
+		};
+	}
+	return resolved;
 }
 
 /**

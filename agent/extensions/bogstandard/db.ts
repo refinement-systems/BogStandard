@@ -56,9 +56,13 @@ function requireConfig(): ResolvedConfig {
 export function getPool(): pg.Pool {
 	if (!pool) {
 		const cfg = requireConfig();
-		pool = new Pool({ connectionString: cfg.databaseUrl });
+		pool = new Pool({ connectionString: cfg.databaseUrl, allowExitOnIdle: true });
 	}
 	return pool;
+}
+
+export function getConfiguredDatabaseUrl(): string {
+	return requireConfig().databaseUrl;
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -72,6 +76,10 @@ export type Phase =
 	| "red_impl"
 	| "green_planning"
 	| "green_impl"
+	| "merging_pending"
+	| "merging"
+	| "merge_repair"
+	| "merge_failed"
 	| "done"
 	| "aborted"
 	| "archived";
@@ -85,12 +93,21 @@ export const ALL_PHASES: readonly Phase[] = [
 	"red_impl",
 	"green_planning",
 	"green_impl",
+	"merging_pending",
+	"merging",
+	"merge_repair",
+	"merge_failed",
 	"done",
 	"aborted",
 	"archived",
 ];
 
-/** Phases that mean an agent is actively working the issue. */
+/**
+ * Phases that mean an agent is actively working the issue. The merge phases
+ * are driven by the merge daemon, not a per-issue agent claim, so they are
+ * not counted here — `transitionPhase` will clear `current_agent_id` when
+ * entering any of them.
+ */
 export function isWorkingPhase(phase: Phase): boolean {
 	return (
 		phase === "planning" ||

@@ -31,11 +31,20 @@
  * overwrite an existing config.json unless --force is passed.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import pg from "pg";
+import { DEFAULT_MERGE_STAGING_WORKTREE } from "../agent/extensions/bogstandard/config.js";
 import { applyMigrations } from "./lib/migrations.js";
+import {
+	isStagingWorktreeRegistered,
+	parseWorktreesPorcelain,
+} from "./lib/merge-worker.js";
+
+const execFileP = promisify(execFile);
 
 const { Client } = pg;
 
@@ -147,10 +156,152 @@ export function writeConfig(
 		database_url: args.databaseUrl,
 		agent_id: args.agentId ?? "main",
 		stale_lock_timeout_minutes: args.staleLockTimeoutMinutes ?? 60,
+		merge: {
+			test_command: ["npm", "test"],
+			test_timeout_seconds: 600,
+		},
 	};
 	writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`);
 	console.log(`Wrote ${path}.`);
+	console.log(
+		`  ! Edit ${path} → "merge.test_command" to match this project before running bs-merge-worker.`,
+	);
+	console.log(
+		`  ! If merge repair should run from the daemon without /bs-task model flags, set "merge.repair_model" explicitly.`,
+	);
 	return path;
+}
+
+export interface RunSetupOptions {
+	databaseUrl: string;
+	projectRoot: string;
+	agentId?: string;
+	staleLockTimeoutMinutes?: number;
+	force?: boolean;
+	migrationsDir?: string;
+	log?: (msg: string) => void;
+	/**
+	 * When true (default), create `.bogstandard/merge-staging` as a detached
+	 * git worktree off `main`. Skipped silently if `projectRoot` is not inside
+	 * a git work tree. Tests that drive setup against a non-git tmpdir pass
+	 * `false` to suppress even the git-detection probe.
+	 */
+	createStagingWorktree?: boolean;
+}
+
+interface GitExecResult {
+	stdout: string;
+	stderr: string;
+	code: number;
+}
+
+async function runGit(args: string[], cwd: string): Promise<GitExecResult> {
+	try {
+		const res = await execFileP("git", args, { cwd });
+		return { stdout: res.stdout, stderr: res.stderr ?? "", code: 0 };
+	} catch (err) {
+		const e = err as { stdout?: string; stderr?: string; code?: number };
+		if (typeof e.code === "number") {
+			return { stdout: e.stdout ?? "", stderr: e.stderr ?? "", code: e.code };
+		}
+		throw err;
+	}
+}
+
+/** Resolve symlinks if possible; fall back to `resolve()` on failure. macOS
+ * tmpdirs and the `git worktree list` output disagree on `/var` vs
+ * `/private/var` otherwise. Mirrors `canonicalize` in
+ * `scripts/run-merge-worker.ts`.
+ */
+function canonicalize(path: string): string {
+	const abs = resolve(path);
+	try {
+		return realpathSync(abs);
+	} catch {
+		return abs;
+	}
+}
+
+/**
+ * Create `.bogstandard/merge-staging` as a detached worktree off `main` if
+ * it's not already registered. Idempotent on repeat runs. Throws with an
+ * actionable message if git fails (most commonly: no `main` branch).
+ */
+export async function ensureStagingWorktree(
+	projectRoot: string,
+	log: (msg: string) => void,
+): Promise<void> {
+	const probe = await runGit(["rev-parse", "--is-inside-work-tree"], projectRoot);
+	if (probe.code !== 0 || probe.stdout.trim() !== "true") {
+		log(`Skipping merge-staging worktree: ${projectRoot} is not a git repository.`);
+		return;
+	}
+
+	const list = await runGit(["worktree", "list", "--porcelain"], projectRoot);
+	if (list.code !== 0) {
+		throw new Error(
+			`Could not list git worktrees in ${projectRoot}: ${list.stderr.trim() || "git exited non-zero"}`,
+		);
+	}
+	const canonicalRoot = canonicalize(projectRoot);
+	const entries = parseWorktreesPorcelain(list.stdout).map((entry) => ({
+		...entry,
+		path: canonicalize(entry.path),
+	}));
+	if (isStagingWorktreeRegistered(entries, DEFAULT_MERGE_STAGING_WORKTREE, canonicalRoot)) {
+		log(`Merge-staging worktree already present at ${DEFAULT_MERGE_STAGING_WORKTREE}.`);
+		return;
+	}
+
+	const add = await runGit(
+		["worktree", "add", "--detach", DEFAULT_MERGE_STAGING_WORKTREE, "main"],
+		projectRoot,
+	);
+	if (add.code !== 0) {
+		throw new Error(
+			`Could not create merge-staging worktree at ${DEFAULT_MERGE_STAGING_WORKTREE} ` +
+				`(does branch 'main' exist?). git stderr: ${add.stderr.trim() || "(empty)"}`,
+		);
+	}
+	log(`Created merge-staging worktree at ${DEFAULT_MERGE_STAGING_WORKTREE}.`);
+}
+
+function defaultMigrationsDir(): string {
+	const scriptDir = dirname(fileURLToPath(import.meta.url));
+	return resolve(scriptDir, "..", "db/migrations");
+}
+
+/**
+ * Programmatic entry point shared by the CLI (`main`) and the
+ * setup-e2e integration test. Creates the DB if missing, applies the
+ * full migration chain, and writes the project's `.bogstandard/config.json`.
+ */
+export async function runSetup(opts: RunSetupOptions): Promise<void> {
+	const log = opts.log ?? ((msg: string) => console.log(msg));
+	const { adminUrl, dbName } = splitDatabaseUrl(opts.databaseUrl);
+	const exists = await databaseExists(adminUrl, dbName);
+	if (!exists) {
+		await createDatabase(adminUrl, dbName);
+	} else {
+		log(`Database "${dbName}" already exists; applying schema (idempotent).`);
+	}
+
+	const migrationsDir = opts.migrationsDir ?? defaultMigrationsDir();
+	await applyMigrations(opts.databaseUrl, migrationsDir);
+
+	if (opts.createStagingWorktree ?? true) {
+		await ensureStagingWorktree(opts.projectRoot, log);
+	}
+
+	writeConfig(
+		opts.projectRoot,
+		{
+			databaseUrl: opts.databaseUrl,
+			agentId: opts.agentId,
+			staleLockTimeoutMinutes: opts.staleLockTimeoutMinutes,
+		},
+		opts.force ?? false,
+	);
 }
 
 async function main(): Promise<void> {
@@ -161,25 +312,23 @@ async function main(): Promise<void> {
 		throw new Error("\n--database-url is required (or set BOGSTANDARD_DATABASE_URL).");
 	}
 
-	const { adminUrl, dbName } = splitDatabaseUrl(databaseUrl);
-	const exists = await databaseExists(adminUrl, dbName);
-	if (!exists) {
-		await createDatabase(adminUrl, dbName);
-	} else {
-		console.log(`Database "${dbName}" already exists; applying schema (idempotent).`);
-	}
-
 	const scriptDir = dirname(fileURLToPath(import.meta.url));
 	const bogstandardHome = resolve(scriptDir, "..");
 	const projectRoot = process.env.BS_PROJECT_ROOT ?? process.cwd();
-	const migrationsDir = resolve(bogstandardHome, "db/migrations");
-	await applyMigrations(databaseUrl, migrationsDir);
 
-	writeConfig(projectRoot, { databaseUrl, agentId: args.agentId, staleLockTimeoutMinutes: args.staleLockTimeoutMinutes }, args.force);
+	await runSetup({
+		databaseUrl,
+		projectRoot,
+		agentId: args.agentId,
+		staleLockTimeoutMinutes: args.staleLockTimeoutMinutes,
+		force: args.force,
+	});
 
-	console.log(`\nDone. Run pi from ${projectRoot} with:`);
+	console.log(`\nDone. Run from ${projectRoot}:`);
 	console.log(`  pi -e ${bogstandardHome}/agent/extensions/bogstandard /bs-design   # brainstorm + create issues`);
-	console.log(`  pi -e ${bogstandardHome}/agent/extensions/bogstandard /bs-task     # plan + implement next eligible issue`);
+	console.log(`  ${bogstandardHome}/bin/bs-run                                       # plan + implement next eligible issue, then merge it`);
+	console.log(`\nAdvanced (debugging):`);
+	console.log(`  pi -e ${bogstandardHome}/agent/extensions/bogstandard /bs-task     # interactive single worker, no auto-merge`);
 }
 
 function reportError(err: unknown): void {

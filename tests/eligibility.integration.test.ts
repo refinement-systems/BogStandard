@@ -28,6 +28,7 @@ import {
 	getPool,
 	issueCreate,
 	transitionPhase,
+	type Phase,
 } from "../agent/extensions/bogstandard/db.js";
 import { listEligible } from "../agent/extensions/bogstandard/issue-picker.js";
 import { isPostgresAvailable, useTempDb } from "./helpers/temp-db.js";
@@ -90,6 +91,19 @@ describe.skipIf(!isPostgresAvailable())("ELIGIBLE_SQL", () => {
 		expect(ids.has(blockedByAborted)).toBe(false);
 		expect(ids.has(blockedByReady)).toBe(false);
 	});
+
+	it.each<Phase>(["merging_pending", "merging", "merge_repair", "merge_failed"])(
+		"%s blocker keeps downstream issue out of eligibility",
+		async (phase) => {
+			const blocker = await makeReady("blocker");
+			await transitionPhase(pi, { issueId: blocker, from: "ready", to: phase, agentId: null });
+			const blocked = await makeReady("blocked");
+			await dependencyAdd(pi, blocked, blocker);
+
+			const ids = (await listEligible(pi, 60)).map((r) => r.id);
+			expect(ids).not.toContain(blocked);
+		},
+	);
 
 	it("excludes fresh claims; includes claims older than the stale threshold", async () => {
 		const id = await makeReady("claimed");

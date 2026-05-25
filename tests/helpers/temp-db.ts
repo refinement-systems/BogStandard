@@ -36,13 +36,14 @@
  * migration backfills against realistic legacy data.
  */
 
-import { mkdtempSync, readdirSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { afterAll, beforeAll } from "vitest";
+import { runner } from "node-pg-migrate";
 import { configureDb, resetDbForTests } from "../../agent/extensions/bogstandard/db.js";
 import { applyMigrations } from "../../scripts/lib/migrations.js";
 
@@ -125,25 +126,36 @@ export async function dropDatabase(dbName: string): Promise<void> {
 
 /**
  * Apply migrations from MIGRATIONS_DIR only up to and including `throughFile`
- * (e.g. "0002_draft_status.sql"). Achieved by copying the subset into a temp
- * dir and pointing the production runner at it. Throws if `throughFile`
- * doesn't exist in the migrations directory.
+ * (e.g. "0002_draft_status.sql"). Uses node-pg-migrate's `count` option
+ * against the real migrations directory so each migration file resolves
+ * paths (e.g. `__dirname` for .cjs migrations that read sibling vendor
+ * files) against its original location. Throws if `throughFile` doesn't
+ * exist in the migrations directory.
  */
 export async function applyMigrationsThrough(url: string, throughFile: string): Promise<void> {
-	const all = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith(".sql")).sort();
-	if (!all.includes(throughFile)) {
+	const all = readdirSync(MIGRATIONS_DIR)
+		.filter((f) => /^\d{4}_/.test(f))
+		.sort();
+	const idx = all.indexOf(throughFile);
+	if (idx < 0) {
 		throw new Error(`applyMigrationsThrough: ${throughFile} not in ${MIGRATIONS_DIR}`);
 	}
-	const subset = all.slice(0, all.indexOf(throughFile) + 1);
-	const tmp = mkdtempSync(join(tmpdir(), "bs-migrations-"));
-	try {
-		for (const f of subset) {
-			copyFileSync(join(MIGRATIONS_DIR, f), join(tmp, f));
-		}
-		await applyMigrations(url, tmp);
-	} finally {
-		rmSync(tmp, { recursive: true, force: true });
-	}
+	await runner({
+		databaseUrl: url,
+		dir: MIGRATIONS_DIR,
+		direction: "up",
+		count: idx + 1,
+		migrationsTable: "pgmigrations",
+		logger: {
+			debug: () => {},
+			info: () => {},
+			warn: () => {},
+			error: (msg: unknown) => {
+				if (typeof msg === "string" && msg.includes("Can't determine timestamp")) return;
+				console.error(msg);
+			},
+		},
+	});
 }
 
 /**

@@ -14,6 +14,8 @@
 import { describe, expect, it } from "vitest";
 import {
 	DEFAULT_AGENT_ID,
+	DEFAULT_MERGE_STAGING_WORKTREE,
+	DEFAULT_MERGE_TEST_TIMEOUT_SECONDS,
 	DEFAULT_STALE_LOCK_TIMEOUT_MINUTES,
 	resolveConfig,
 } from "../agent/extensions/bogstandard/config.js";
@@ -87,5 +89,65 @@ describe("resolveConfig precedence", () => {
 		expect(
 			resolveConfig({ flagDatabaseUrl: "postgres://x" }).staleLockTimeoutMinutes,
 		).toBe(DEFAULT_STALE_LOCK_TIMEOUT_MINUTES);
+	});
+});
+
+describe("resolveConfig merge block", () => {
+	it("leaves merge undefined when the file omits the block", () => {
+		expect(
+			resolveConfig({ flagDatabaseUrl: "postgres://x" }).merge,
+		).toBeUndefined();
+	});
+
+	it("passes through test_command from the file", () => {
+		const out = resolveConfig({
+			flagDatabaseUrl: "postgres://x",
+			file: { merge: { test_command: ["pnpm", "test"] } },
+		});
+		expect(out.merge?.testCommand).toEqual(["pnpm", "test"]);
+	});
+
+	it("passes through repair_model from the file", () => {
+		const out = resolveConfig({
+			flagDatabaseUrl: "postgres://x",
+			file: { merge: { test_command: ["npm", "test"], repair_model: "test/repair" } },
+		});
+		expect(out.merge?.repairModel).toBe("test/repair");
+	});
+
+	it("defaults timeout + staging worktree when the merge block is present but incomplete", () => {
+		const out = resolveConfig({
+			flagDatabaseUrl: "postgres://x",
+			file: { merge: { test_command: ["npm", "test"] } },
+		});
+		expect(out.merge?.testTimeoutSeconds).toBe(DEFAULT_MERGE_TEST_TIMEOUT_SECONDS);
+		expect(out.merge?.stagingWorktree).toBe(DEFAULT_MERGE_STAGING_WORKTREE);
+	});
+
+	it("respects explicit timeout and staging worktree overrides", () => {
+		const out = resolveConfig({
+			flagDatabaseUrl: "postgres://x",
+			file: {
+				merge: {
+					test_command: ["npm", "test"],
+					test_timeout_seconds: 30,
+					staging_worktree: "/tmp/staging",
+				},
+			},
+		});
+		expect(out.merge?.testTimeoutSeconds).toBe(30);
+		expect(out.merge?.stagingWorktree).toBe("/tmp/staging");
+	});
+
+	it("produces a merge block even when test_command is missing (daemon asserts later)", () => {
+		const out = resolveConfig({
+			flagDatabaseUrl: "postgres://x",
+			file: { merge: {} },
+		});
+		expect(out.merge).toBeDefined();
+		expect(out.merge?.testCommand).toBeUndefined();
+		expect(out.merge?.testTimeoutSeconds).toBe(DEFAULT_MERGE_TEST_TIMEOUT_SECONDS);
+		expect(out.merge?.stagingWorktree).toBe(DEFAULT_MERGE_STAGING_WORKTREE);
+		expect(out.merge?.repairModel).toBeUndefined();
 	});
 });

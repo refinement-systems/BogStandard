@@ -88,12 +88,29 @@ export const FIND_CYCLE_SQL = `
 	SELECT path FROM walk WHERE found LIMIT 1
 `;
 
+export const PENDING_MERGES_SQL = `
+	SELECT i.id, i.phase
+	  FROM issues i
+	 WHERE i.phase IN ('merging_pending', 'merging', 'merge_repair', 'merge_failed')
+	 ORDER BY i.id
+`;
+
 interface EligibleRow extends Record<string, unknown> {
 	id: string | number;
 	title: string;
 	priority: string;
 	phase: Phase;
 	needs_tests: boolean | null;
+}
+
+export interface PendingMergeEntry {
+	id: number;
+	phase: Extract<Phase, "merging_pending" | "merging" | "merge_repair" | "merge_failed">;
+}
+
+interface PendingMergeRow extends Record<string, unknown> {
+	id: string | number;
+	phase: PendingMergeEntry["phase"];
 }
 
 export async function listEligibleWith(
@@ -112,6 +129,18 @@ export async function listEligibleWith(
 
 export async function listEligible(_pi: ExtensionAPI, staleLockTimeoutMinutes: number): Promise<IssueListEntry[]> {
 	return listEligibleWith(getPool(), staleLockTimeoutMinutes);
+}
+
+export async function listPendingMergesWith(runner: QueryRunner): Promise<PendingMergeEntry[]> {
+	const result = await runner.query<PendingMergeRow>(PENDING_MERGES_SQL);
+	return result.rows.map((r) => ({
+		id: Number(r.id),
+		phase: r.phase,
+	}));
+}
+
+export async function listPendingMerges(_pi: ExtensionAPI): Promise<PendingMergeEntry[]> {
+	return listPendingMergesWith(getPool());
 }
 
 export async function pickFirstEligible(

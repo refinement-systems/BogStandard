@@ -12,8 +12,13 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { IssueDetail } from "../agent/extensions/bogstandard/db.js";
-import { buildIssueDisplay, isPhaseStale } from "../agent/extensions/bogstandard/db.js";
+import type { IssueDetail, Phase } from "../agent/extensions/bogstandard/db.js";
+import {
+	ALL_PHASES,
+	buildIssueDisplay,
+	isPhaseStale,
+	isWorkingPhase,
+} from "../agent/extensions/bogstandard/db.js";
 
 function issue(overrides: Partial<IssueDetail> = {}): IssueDetail {
 	return {
@@ -53,6 +58,47 @@ describe("isPhaseStale", () => {
 
 	it("null timestamp is not stale (no owner)", () => {
 		expect(isPhaseStale(null, SIXTY_MIN)).toBe(false);
+	});
+});
+
+describe("ALL_PHASES", () => {
+	it("includes the four merge-flow phases between *_impl and done", () => {
+		expect(ALL_PHASES).toContain("merging_pending");
+		expect(ALL_PHASES).toContain("merging");
+		expect(ALL_PHASES).toContain("merge_repair");
+		expect(ALL_PHASES).toContain("merge_failed");
+	});
+
+	it("orders merge phases after green_impl and before done", () => {
+		const idx = (p: Phase) => ALL_PHASES.indexOf(p);
+		expect(idx("merging_pending")).toBeGreaterThan(idx("green_impl"));
+		expect(idx("merging")).toBeGreaterThan(idx("merging_pending"));
+		expect(idx("merge_repair")).toBeGreaterThan(idx("merging"));
+		expect(idx("merge_failed")).toBeGreaterThan(idx("merge_repair"));
+		expect(idx("done")).toBeGreaterThan(idx("merge_failed"));
+	});
+});
+
+describe("isWorkingPhase", () => {
+	it.each<Phase>(["planning", "implementing", "red_planning", "red_impl", "green_planning", "green_impl"])(
+		"%s is a working phase",
+		(p) => {
+			expect(isWorkingPhase(p)).toBe(true);
+		},
+	);
+
+	it.each<Phase>([
+		"drafting",
+		"ready",
+		"merging_pending",
+		"merging",
+		"merge_repair",
+		"merge_failed",
+		"done",
+		"aborted",
+		"archived",
+	])("%s is not a working phase", (p) => {
+		expect(isWorkingPhase(p)).toBe(false);
 	});
 });
 

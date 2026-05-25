@@ -53,8 +53,9 @@ import {
 	type Phase,
 } from "./db.js";
 import { loadConfig } from "./config.js";
-import { addAll, commit, hasStagedChanges, headShortSha, isClean, resetHardHeadMinus1, resetHardToRef, showHeadDiff, statusShort } from "./git.js";
-import { findBlockCycle, formatIssueLabel, listEligible, pickFirstEligible } from "./issue-picker.js";
+import { addAll, commit, gitRevListCount, hasStagedChanges, headShortSha, isClean, resetHardHeadMinus1, resetHardToRef, showHeadDiff, statusShort } from "./git.js";
+import { publishWorkerBranch, routeCloseAction } from "./merge-handoff.js";
+import { findBlockCycle, formatIssueLabel, listEligible, listPendingMerges, pickFirstEligible } from "./issue-picker.js";
 import { IDLE_STATE, isMidWorkPhase, loadState, loadStateForIssue, endReason, type BogstandardState } from "./phases.js";
 import {
 	buildGreenImplementPrompt,
@@ -70,6 +71,7 @@ import {
 import { registerQuestionnaireTool } from "./questionnaire.js";
 import { registerDesigner } from "./designer.js";
 import { showScrollableMarkdown } from "./scrollable-markdown.js";
+import { shouldShutdownInSingleShot, type ShutdownBoundary } from "./single-shot.js";
 
 const PLAN_TOOLS = ["read", "grep", "find", "ls", "bash", "questionnaire", "save_plan", "propose_redraft"];
 const IMPL_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"];
@@ -131,6 +133,10 @@ export default function bogstandard(pi: ExtensionAPI) {
 		description: "Model for the TDD green-phase implementer (provider/id). Overrides --bs-impl-model.",
 		type: "string",
 	});
+	pi.registerFlag("bs-merge-repair-model", {
+		description: "Model for the merge-repair agent (provider/id). Overrides --bs-impl-model.",
+		type: "string",
+	});
 	pi.registerFlag("bs-issue-id", {
 		description:
 			"Issue ID to work on (set by dispatch.sh to pre-assign workers). For interactive use, type '/bs-task <id>' in the prompt instead.",
@@ -150,6 +156,20 @@ export default function bogstandard(pi: ExtensionAPI) {
 		description: "Print the system prompt and user prompt before each agent phase starts.",
 		type: "boolean",
 	});
+	pi.registerFlag("bs-single-shot", {
+		description:
+			"Exit pi after the current /bs-task reaches a terminal outcome. Used by bs-run.",
+		type: "boolean",
+	});
+
+	// ── Helpers ───────────────────────────────────────────────────────────────
+
+	function maybeShutdown(ctx: ExtensionContext, boundary: ShutdownBoundary): void {
+		const flag = pi.getFlag("bs-single-shot") as boolean | undefined;
+		if (!shouldShutdownInSingleShot(flag, boundary)) return;
+		ctx.ui.notify(`single-shot: ${boundary} — exiting pi`, "info");
+		ctx.shutdown();
+	}
 
 	// ── Tools ─────────────────────────────────────────────────────────────────
 
@@ -317,6 +337,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				}
 				if (!picked) {
 					let cycleNote = "";
+					let pendingMergeNote = "";
 					try {
 						const cycle = await findBlockCycle(pi);
 						if (cycle && cycle.length > 0) {
@@ -325,10 +346,20 @@ export default function bogstandard(pi: ExtensionAPI) {
 					} catch {
 						// non-fatal: best-effort diagnostic
 					}
+					try {
+						const pending = await listPendingMerges(pi);
+						if (pending.length > 0) {
+							const list = pending.map((i) => `#${i.id} (${i.phase})`).join(", ");
+							pendingMergeNote = ` Pending merge-phase issues: ${list}. Run bs-merge-worker, or inspect merge_failed work before retrying.`;
+						}
+					} catch {
+						// non-fatal: best-effort diagnostic
+					}
 					ctx.ui.notify(
-						`No eligible issues found.${cycleNote} Run /bs-design to draft or classify some.`,
+						`No eligible issues found.${cycleNote}${pendingMergeNote} Run /bs-design to draft or classify some.`,
 						"warning",
 					);
+					maybeShutdown(ctx, "no_eligible");
 					return;
 				}
 			}
@@ -352,6 +383,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 					`Issue #${issue.id} is in phase '${issue.phase}' — only 'ready' issues can be started. Run /bs-design to redraft or unarchive.`,
 					"error",
 				);
+				maybeShutdown(ctx, "invalid_issue");
 				return;
 			}
 
@@ -360,6 +392,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 					`Issue #${issue.id} is missing needs_tests classification. Run /bs-design to set it before /bs-task.`,
 					"error",
 				);
+				maybeShutdown(ctx, "missing_needs_tests");
 				return;
 			}
 
@@ -369,7 +402,10 @@ export default function bogstandard(pi: ExtensionAPI) {
 
 			// Issue review.
 			const confirmed = await runIssueReviewLoop(ctx);
-			if (!confirmed || !issue) return;
+			if (!confirmed || !issue) {
+				maybeShutdown(ctx, "aborted_before_planning");
+				return;
+			}
 
 			const myAgentId = await getAgentId(pi);
 			if (!myAgentId) {
@@ -380,6 +416,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 			const claimed = await claimIssue(pi, issue.id, myAgentId, getStaleTimeoutMinutes());
 			if (!claimed) {
 				ctx.ui.notify(`Could not claim issue #${issue.id}: another agent holds the claim.`, "error");
+				maybeShutdown(ctx, "claim_failed");
 				return;
 			}
 
@@ -393,6 +430,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 							"TDD path requires a clean working tree. Stash or commit your changes, then re-run /bs-task.",
 							"error",
 						);
+						maybeShutdown(ctx, "dirty_tree");
 						return;
 					}
 				} catch (err) {
@@ -629,6 +667,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		ctx.ui.notify(`Issue #${issue.id} aborted.`, "info");
 		state = { ...IDLE_STATE };
 		issue = undefined;
+		maybeShutdown(ctx, "aborted_resume_or_plan_review");
 	}
 
 	async function routeContinueResume(ctx: ExtensionContext): Promise<void> {
@@ -742,6 +781,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		);
 		state = { ...IDLE_STATE };
 		issue = undefined;
+		maybeShutdown(ctx, "redraft_proposed");
 	}
 
 	// ── Plan review ────────────────────────────────────────────────────────────
@@ -869,6 +909,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				ctx.ui.notify("Aborted in-session. Issue left in-progress; re-run /bs-task to resume.", "info");
 				state = { ...IDLE_STATE };
 				issue = undefined;
+				maybeShutdown(ctx, "continue_cancelled");
 				return;
 			}
 			let prompt = userInput.trim() || defaultPrompt;
@@ -921,6 +962,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		);
 		state = { ...IDLE_STATE };
 		issue = undefined;
+		maybeShutdown(ctx, "wip_quit");
 	}
 
 	// ── Interrupt ─────────────────────────────────────────────────────────────
@@ -1116,10 +1158,19 @@ export default function bogstandard(pi: ExtensionAPI) {
 		} catch {
 			// proceed normally
 		}
+		let commitsAhead = 0;
+		try {
+			commitsAhead = await gitRevListCount(pi, "main..HEAD");
+		} catch {
+			// non-fatal: if `main` is unreachable (rare in a worker worktree) treat
+			// as no commits ahead; the dirty branch will still commit, the clean
+			// branch will fall into the no-changes UX.
+		}
 
 		const myAgentId = await getAgentId(pi);
+		const route = routeCloseAction(clean, commitsAhead);
 
-		if (clean) {
+		if (route === "no_changes") {
 			while (true) {
 				const choice = await ctx.ui.select(
 					"No file changes detected — what would you like to do?",
@@ -1163,47 +1214,47 @@ export default function bogstandard(pi: ExtensionAPI) {
 			ctx.ui.notify(`Issue #${currentIssue.id} closed (no files changed).`, "info");
 			state = { ...IDLE_STATE };
 			issue = undefined;
+			maybeShutdown(ctx, "no_change_closed");
 			return;
 		}
 
-		try {
-			await addAll(pi);
-			const description = buildIssueDisplay(currentIssue);
-			await commit(
-				pi,
-				currentIssue.title,
-				description.trim() !== "" ? description : undefined,
-			);
-		} catch (err) {
-			ctx.ui.notify(`Failed to commit: ${err}`, "error");
+		if (route === "commit_then_publish") {
+			try {
+				await addAll(pi);
+				const description = buildIssueDisplay(currentIssue);
+				await commit(
+					pi,
+					currentIssue.title,
+					description.trim() !== "" ? description : undefined,
+				);
+			} catch (err) {
+				ctx.ui.notify(`Failed to commit: ${err}`, "error");
+				return;
+			}
+		}
+
+		// publish (commit_then_publish + publish_existing converge here).
+		const fromPhase = state.phase;
+		if (!fromPhase) {
+			ctx.ui.notify("No active phase — cannot publish for merge.", "error");
 			return;
 		}
-
-		let sha = "unknown";
 		try {
-			sha = await headShortSha(pi);
-		} catch {
-			// non-fatal
-		}
-
-		try {
-			await transitionPhase(pi, {
+			await publishWorkerBranch(pi, {
 				issueId: currentIssue.id,
-				from: state.phase,
-				to: "done",
+				fromPhase,
 				agentId: myAgentId,
-				reason: "implementation committed",
-				metadata: { final_sha: sha },
+				repairModel: resolveModelFor("merge_repair"),
 			});
 		} catch (err) {
-			ctx.ui.notify(`Failed to close issue: ${err}`, "error");
+			ctx.ui.notify(`Failed to publish for merge: ${err}`, "error");
 			return;
 		}
-		if (myAgentId) await releaseIssue(pi, currentIssue.id, myAgentId);
 
-		ctx.ui.notify(`Issue #${currentIssue.id} closed and committed (${sha}).`, "info");
+		ctx.ui.notify(`Issue #${currentIssue.id} committed and queued for merge.`, "info");
 		state = { ...IDLE_STATE };
 		issue = undefined;
+		maybeShutdown(ctx, "queued_for_merge");
 	}
 
 	// ── Kickoff + model selection ─────────────────────────────────────────────
@@ -1219,6 +1270,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 			case "red_impl":        return get("bs-red-impl-model")   ?? broadImpl;
 			case "green_planning":  return get("bs-green-plan-model") ?? broadPlan;
 			case "green_impl":      return get("bs-green-impl-model") ?? broadImpl;
+			case "merge_repair":    return get("bs-merge-repair-model") ?? broadImpl;
 			default:                return undefined;
 		}
 	}

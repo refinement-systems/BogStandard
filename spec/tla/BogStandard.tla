@@ -2,13 +2,11 @@
 \* BogStandard /bs-task phase machine across N concurrent workers,
 \* with an abstract model of git/merge state.
 \*
-\* v1 (this module) reproduces the *current* implementation: workers
-\* commit to per-worktree branches and mark issues `done` without ever
-\* merging back to main. The `MergeSoundness` invariant exhibits the
-\* resulting bug — TLC will find a short counterexample.
+\* v2 models the merge-flow fix: workers publish issue refs, a merge daemon
+\* lands those refs on main, and `done` means the issue's code is on main.
 \*
 \* What this models concretely:
-\*   - the phase set from db.ts:66-77 (minus 'drafting' and 'archived':
+\*   - the phase set from db.ts:66-85 (minus 'drafting' and 'archived':
 \*     issues are born 'ready', and archive is a Designer concern)
 \*   - the atomic conditional-UPDATE transition pattern in db.ts:800
 \*   - the claim-on-ownership protocol (db.ts:970), simplified: no
@@ -20,21 +18,22 @@
 \* What is abstracted:
 \*   - pi runtime: each agent step is one atomic, nondeterministic action
 \*   - Postgres: transitionPhase / claimIssue are atomic
-\*   - git mechanics: no conflict modelling; an issue's work is either
-\*     not yet started, on a branch, or (in v2) merged to main
+\*   - git mechanics: no concrete SHA/conflict modelling; an issue ref is
+\*     either unpublished, published for the daemon, or merged to main
 \*   - Designer: skipped entirely
 \*
-\* Deliberately omitted in v1; planned for v2:
+\* Deliberately omitted:
 \*   - Steal action (db.ts:1007)
 \*   - Release without completion (the "Not done, quitting" path)
-\*   - work_state / branch_base / a Merge action that advances
-\*     main_committed (the fix for the bug this spec exhibits)
+\*   - the no-commits-to-merge shortcut, which can transition directly to
+\*     done in implementation; every modeled implementation publishes a ref
+\*   - concrete merge conflicts/tests/repair-agent transcript details
 \*
-\* Topology is hardcoded for v1: two workers (w1, w2), two issues
+\* Topology is hardcoded: two workers (w1, w2), two issues
 \* (i1 no-tests, i2 TDD), i1 blocks i2. TLC's cfg parser only accepts
 \* bare model-value literals, so the worker/issue sets and the
 \* needs_tests + blocker relations are defined here rather than in the
-\* cfg. v2 will likely move to an MC-style model wrapper for variants.
+\* cfg. A future larger model can move this to an MC-style wrapper.
 
 EXTENDS Naturals, FiniteSets
 
@@ -55,9 +54,10 @@ VARIABLES
   issue_owner,    \* [Issues -> Workers \cup {NULL}]
   worker_issue,   \* [Workers -> Issues \cup {NULL}]
   main_committed, \* SUBSET Issues
+  ref_published,  \* [Issues -> BOOLEAN]
   bail_count      \* [Issues -> 0..MAX_BAILS]
 
-vars == <<issue_phase, issue_owner, worker_issue, main_committed, bail_count>>
+vars == <<issue_phase, issue_owner, worker_issue, main_committed, ref_published, bail_count>>
 
 \* ── Phase classification ────────────────────────────────────────────────
 
@@ -65,12 +65,14 @@ Phases == {"ready",
            "planning",       "implementing",
            "red_planning",   "red_impl",
            "green_planning", "green_impl",
+           "merging_pending", "merging",
+           "merge_repair",   "merge_failed",
            "done",           "aborted"}
 
 PlanningPhases == {"planning", "red_planning", "green_planning"}
 ImplPhases     == {"implementing", "red_impl", "green_impl"}
 WorkingPhases  == PlanningPhases \cup ImplPhases
-TerminalPhases == {"done", "aborted"}
+TerminalPhases == {"done", "aborted", "merge_failed"}
 
 \* ── State invariants ───────────────────────────────────────────────────
 
@@ -79,6 +81,7 @@ TypeOK ==
   /\ issue_owner    \in [Issues -> Workers \cup {NULL}]
   /\ worker_issue   \in [Workers -> Issues \cup {NULL}]
   /\ main_committed \subseteq Issues
+  /\ ref_published  \in [Issues -> BOOLEAN]
   /\ bail_count     \in [Issues -> 0..MAX_BAILS]
 
 Init ==
@@ -86,6 +89,7 @@ Init ==
   /\ issue_owner    = [i \in Issues  |-> NULL]
   /\ worker_issue   = [w \in Workers |-> NULL]
   /\ main_committed = {}
+  /\ ref_published  = [i \in Issues  |-> FALSE]
   /\ bail_count     = [i \in Issues  |-> 0]
 
 \* ── Eligibility (issue-picker.ts:46) ───────────────────────────────────
@@ -110,7 +114,7 @@ Claim(w, i) ==
   /\ Eligible(i)
   /\ issue_owner'  = [issue_owner  EXCEPT ![i] = w]
   /\ worker_issue' = [worker_issue EXCEPT ![w] = i]
-  /\ UNCHANGED <<issue_phase, main_committed, bail_count>>
+  /\ UNCHANGED <<issue_phase, main_committed, ref_published, bail_count>>
 
 \* /bs-task: ready → red_planning if needs_tests else planning
 \* (index.ts:386). Atomic in transitionPhase.
@@ -119,7 +123,7 @@ StartPlanning(w, i) ==
   /\ issue_phase[i]  = "ready"
   /\ issue_phase' = [issue_phase EXCEPT ![i] =
                        IF NeedsTests(i) THEN "red_planning" ELSE "planning"]
-  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, bail_count>>
+  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, ref_published, bail_count>>
 
 \* Plan accepted: planning_phase → corresponding impl_phase.
 CompletePlanning(w, i) ==
@@ -131,16 +135,20 @@ CompletePlanning(w, i) ==
         /\ issue_phase' = [issue_phase EXCEPT ![i] = "red_impl"]
      \/ /\ issue_phase[i] = "green_planning"
         /\ issue_phase' = [issue_phase EXCEPT ![i] = "green_impl"]
-  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, bail_count>>
+  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, ref_published, bail_count>>
 
-\* No-tests path: implementing → done. THE BUG: never merges to main.
-\* (closeAndCommit at index.ts:1112 commits to the worker branch only.)
-CompleteImpl(w, i) ==
+\* Worker handoff: implementation completion publishes a durable
+\* refs/bogstandard/issue-<id> handle, clears worker ownership, and waits
+\* for the merge daemon. Red implementation still goes to green planning,
+\* so only no-tests implementing and TDD green_impl can publish.
+PublishRef(w, i) ==
   /\ worker_issue[w] = i
-  /\ issue_phase[i] = "implementing"
-  /\ issue_phase'  = [issue_phase  EXCEPT ![i] = "done"]
+  /\ issue_phase[i] \in {"implementing", "green_impl"}
+  /\ ref_published[i] = FALSE
+  /\ issue_phase'  = [issue_phase  EXCEPT ![i] = "merging_pending"]
   /\ issue_owner'  = [issue_owner  EXCEPT ![i] = NULL]
   /\ worker_issue' = [worker_issue EXCEPT ![w] = NULL]
+  /\ ref_published' = [ref_published EXCEPT ![i] = TRUE]
   /\ UNCHANGED <<main_committed, bail_count>>
 
 \* TDD red impl complete: red_impl → green_planning
@@ -149,16 +157,7 @@ CompleteRedImpl(w, i) ==
   /\ worker_issue[w] = i
   /\ issue_phase[i] = "red_impl"
   /\ issue_phase' = [issue_phase EXCEPT ![i] = "green_planning"]
-  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, bail_count>>
-
-\* TDD green impl complete: green_impl → done. Same merge bug.
-CompleteGreenImpl(w, i) ==
-  /\ worker_issue[w] = i
-  /\ issue_phase[i] = "green_impl"
-  /\ issue_phase'  = [issue_phase  EXCEPT ![i] = "done"]
-  /\ issue_owner'  = [issue_owner  EXCEPT ![i] = NULL]
-  /\ worker_issue' = [worker_issue EXCEPT ![w] = NULL]
-  /\ UNCHANGED <<main_committed, bail_count>>
+  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, ref_published, bail_count>>
 
 \* Green bail: green_impl → red_planning (handleBail at index.ts:1036).
 \* bail_count is per-issue (a bailed-then-resumed issue can bail again).
@@ -168,7 +167,7 @@ BailGreen(w, i) ==
   /\ bail_count[i]   < MAX_BAILS
   /\ issue_phase' = [issue_phase EXCEPT ![i] = "red_planning"]
   /\ bail_count'  = [bail_count  EXCEPT ![i] = @ + 1]
-  /\ UNCHANGED <<issue_owner, worker_issue, main_committed>>
+  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, ref_published>>
 
 \* Abort: any working phase → aborted (covers user-abandon during resume,
 \* propose_redraft accepted, planner Ctrl-C with no recovery, …).
@@ -178,18 +177,64 @@ Abort(w, i) ==
   /\ issue_phase'  = [issue_phase  EXCEPT ![i] = "aborted"]
   /\ issue_owner'  = [issue_owner  EXCEPT ![i] = NULL]
   /\ worker_issue' = [worker_issue EXCEPT ![w] = NULL]
-  /\ UNCHANGED <<main_committed, bail_count>>
+  /\ UNCHANGED <<main_committed, ref_published, bail_count>>
+
+\* Merge daemon claim: the issue has been handed off and is now being
+\* tested/merged in the daemon's staging worktree.
+MergeStart(i) ==
+  /\ issue_phase[i] = "merging_pending"
+  /\ ref_published[i]
+  /\ issue_phase' = [issue_phase EXCEPT ![i] = "merging"]
+  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, ref_published, bail_count>>
+
+\* Happy path: the daemon lands the published ref on main, deletes the
+\* durable issue ref, and only then marks the issue done.
+MergeSucceed(i) ==
+  /\ issue_phase[i] = "merging"
+  /\ ref_published[i]
+  /\ issue_phase'    = [issue_phase    EXCEPT ![i] = "done"]
+  /\ main_committed' = main_committed \cup {i}
+  /\ ref_published'  = [ref_published  EXCEPT ![i] = FALSE]
+  /\ UNCHANGED <<issue_owner, worker_issue, bail_count>>
+
+\* Conflicts or post-merge test failures enter the repair-agent phase.
+MergeConflict(i) ==
+  /\ issue_phase[i] = "merging"
+  /\ ref_published[i]
+  /\ issue_phase' = [issue_phase EXCEPT ![i] = "merge_repair"]
+  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, ref_published, bail_count>>
+
+\* A successful repair returns to merging, where tests/merge finalization
+\* are modeled by a subsequent MergeSucceed.
+RepairFix(i) ==
+  /\ issue_phase[i] = "merge_repair"
+  /\ ref_published[i]
+  /\ issue_phase' = [issue_phase EXCEPT ![i] = "merging"]
+  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, ref_published, bail_count>>
+
+\* Repair bail leaves the durable ref alive for human inspection and ends
+\* the automated workflow for this issue in the v2 model.
+RepairBail(i) ==
+  /\ issue_phase[i] = "merge_repair"
+  /\ ref_published[i]
+  /\ issue_phase' = [issue_phase EXCEPT ![i] = "merge_failed"]
+  /\ UNCHANGED <<issue_owner, worker_issue, main_committed, ref_published, bail_count>>
 
 Next ==
-  \E w \in Workers, i \in Issues :
-    \/ Claim(w, i)
-    \/ StartPlanning(w, i)
-    \/ CompletePlanning(w, i)
-    \/ CompleteImpl(w, i)
-    \/ CompleteRedImpl(w, i)
-    \/ CompleteGreenImpl(w, i)
-    \/ BailGreen(w, i)
-    \/ Abort(w, i)
+  \/ \E w \in Workers, i \in Issues :
+       \/ Claim(w, i)
+       \/ StartPlanning(w, i)
+       \/ CompletePlanning(w, i)
+       \/ PublishRef(w, i)
+       \/ CompleteRedImpl(w, i)
+       \/ BailGreen(w, i)
+       \/ Abort(w, i)
+  \/ \E i \in Issues :
+       \/ MergeStart(i)
+       \/ MergeSucceed(i)
+       \/ MergeConflict(i)
+       \/ RepairFix(i)
+       \/ RepairBail(i)
 
 Spec == Init /\ [][Next]_vars
 
@@ -222,24 +267,19 @@ PhaseShapeOK ==
 BailBound ==
   \A i \in Issues : bail_count[i] <= MAX_BAILS
 
-\* THE BUG-EXHIBIT INVARIANT.
+\* Merge-soundness invariant.
 \*
 \* When a worker enters a planning phase for issue i, every blocker of i
-\* must already be on main — not merely marked `done` in the DB. Today's
-\* code violates this: CompleteImpl / CompleteGreenImpl transition to
-\* `done` without ever advancing main_committed, so a downstream worker
-\* can claim and plan an issue whose blocker's code is still on an
-\* unmerged worker branch.
-\*
-\* v1 has no merge action at all, so main_committed = {} forever, and
-\* this invariant fails the first time any issue with blockers reaches
-\* a planning phase. The expected counterexample is six steps:
-\*   Claim(w1,i1), StartPlanning(w1,i1), CompletePlanning(w1,i1),
-\*   CompleteImpl(w1,i1), Claim(w2,i2), StartPlanning(w2,i2).
-\* v2 will add a `merging` phase + Merge action and re-check this.
+\* must already be on main, not merely handed off to the merge daemon.
+\* Since Eligible only accepts blockers in phase `done`, and v2 only enters
+\* `done` through MergeSucceed, this should hold.
 MergeSoundness ==
   \A w \in Workers, i \in Issues :
     (worker_issue[w] = i /\ issue_phase[i] \in PlanningPhases)
       => (\A b \in Blockers(i) : b \in main_committed)
+
+\* Stronger than MergeSoundness: all done issues must have landed on main.
+DoneImpliesMainCommitted ==
+  \A i \in Issues : issue_phase[i] = "done" => i \in main_committed
 
 ============================================================================

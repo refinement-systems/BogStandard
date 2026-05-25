@@ -48,7 +48,17 @@ describe("isMidWorkPhase", () => {
 		},
 	);
 
-	it.each<Phase>(["drafting", "ready", "done", "aborted", "archived"])(
+	it.each<Phase>([
+		"drafting",
+		"ready",
+		"merging_pending",
+		"merging",
+		"merge_repair",
+		"merge_failed",
+		"done",
+		"aborted",
+		"archived",
+	])(
 		"%s is not mid-work",
 		(p) => {
 			expect(isMidWorkPhase(p)).toBe(false);
