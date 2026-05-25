@@ -34,7 +34,10 @@ BEGIN
        AND array_length(w.path, 1) < 200
        AND NOT (d.blocked_id = ANY(w.path) AND d.blocked_id <> w.start_id)
   )
-  SELECT path INTO cycle_path FROM walk WHERE found LIMIT 1;
+  -- Qualify `found` as `walk.found`: inside a DO block, plain `found` is
+  -- ambiguous between the CTE column and PL/pgSQL's `FOUND` diagnostic
+  -- variable, and Postgres 18 rejects the query as ambiguous.
+  SELECT path INTO cycle_path FROM walk WHERE walk.found LIMIT 1;
   IF cycle_path IS NOT NULL THEN
     RAISE EXCEPTION 'Block-graph cycle detected after backfill: %', cycle_path;
   END IF;
