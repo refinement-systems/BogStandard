@@ -219,4 +219,70 @@ package.json                   # vitest + pg + better-sqlite3 + tsx
 dispatch.sh                    # Multi-worker dispatcher (postgres-backed)
 vitest.config.ts
 tsconfig.json                  # For IDE type checking (noEmit)
+spec/
+  tla/
+    BogStandard.tla            # TLA+ spec of the /bs-task phase state machine
+    BogStandard.cfg            # TLC invariant configuration
+tools/
+  macos/
+    find-tla-tools.sh          # Sourced helper: exports TLA_TOOLS and JAVA
+    tla-check.sh               # Syntax checker (SANY)
+    tla-model-check.sh         # Model checker (TLC)
+```
+
+## TLA+ specification
+
+`spec/tla/BogStandard.tla` models the `/bs-task` phase machine across N
+concurrent workers, plus an abstract per-issue git state. The v1 model
+covers the nine DB phases from `db.ts:66-77` (drafting and archived are
+out of scope — issues are born `ready`), the conditional-UPDATE
+transition pattern in `transitionPhase`, claim-on-ownership, the TDD
+red/green/bail loop, and the eligibility predicate from
+`issue-picker.ts`.
+
+Default config: two workers, two issues (`i1` no-tests, `i2` TDD), `i1`
+blocks `i2`, `MAX_BAILS = 2`. With the bug-exhibit invariant disabled
+(see below), the spec has 41 reachable states at depth 19; TLC finishes
+in about a second.
+
+### Safety invariants
+
+- `TypeOK`, `MutualExclusion`, `OneIssuePerWorker`, `PhaseShapeOK`,
+  `BailBound` — sanity checks; all hold.
+- `MergeSoundness` — **intentionally fails on v1.** It documents the
+  `dispatch.sh` + `closeAndCommit` bug: workers commit to per-worktree
+  branches and mark issues `done` without ever merging back to `main`,
+  so a downstream worker can plan an issue whose blocker's code is
+  still on an unmerged branch. The expected six-step counterexample is
+  `Claim(w1,i1) → StartPlanning → CompletePlanning → CompleteImpl →
+  Claim(w1,i2) → StartPlanning(i2)` — at which point i2 is in
+  `red_planning` while `main_committed = {}` even though i1 is `done`.
+
+### Out of scope for v1, planned for v2
+
+- An explicit `merging` phase between `*_impl` and `done`, plus a
+  `Merge` action that advances `main_committed`. This is the proposed
+  fix; running TLC against v2 should show `MergeSoundness` passing.
+- `Steal` (db.ts:1007) and release-without-completion paths.
+- `work_state ∈ {NoWork, OnBranch, OnMain}` per issue and `branch_base`
+  per worker, for conflict-aware reasoning about merges.
+
+## macOS tools
+
+`tools/macos/` contains shell scripts that drive the TLA+ Toolbox's bundled
+Java and tools jar. The system-wide `java` stub does not work with TLC/SANY.
+
+- `find-tla-tools.sh` — source this in other scripts; exports `TLA_TOOLS`
+  (path to `org.lamport.tlatools_*` plugin) and `JAVA` (bundled java binary).
+  Fails fast if the Toolbox is not installed at `/Applications/TLA+ Toolbox.app`.
+- `tla-check.sh <spec.tla>` — syntax checker (SANY); cds to the spec directory
+  before invoking so TLA+ can resolve module names.
+- `tla-model-check.sh <spec.tla> [config.cfg]` — model checker (TLC); config
+  defaults to `<spec-base>.cfg` in the same directory as the spec.
+
+Quick start from the repo root:
+
+```bash
+tools/macos/tla-check.sh       spec/tla/BogStandard.tla
+tools/macos/tla-model-check.sh spec/tla/BogStandard.tla
 ```

@@ -3,3 +3,4 @@ reference/*
 draft/*
 node_modules/*
 bin/*
+spec/tla/states/
