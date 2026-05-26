@@ -4,11 +4,7 @@ The swamp level of agent orchestrators.
 
 It's all very WIP and changes daily, don't use it yet.
 
-# Licensing
-
-0BSD. Do whatever you want with it.
-
-# Prior art
+## Prior art
 
 Inspiration stolen shamelessly from:
 * [chainlink](https://github.com/dollspace-gay/chainlink)
