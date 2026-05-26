@@ -54,7 +54,7 @@ elif [[ $# -gt 0 ]]; then
 fi
 
 EXT="${BS_HOME}/agent/extensions/bogstandard"
-PI_CMD=(pi -e "$EXT" --bs-single-shot)
+PI_CMD=(pi -e "$EXT")
 if [[ ${#PI_ARGS[@]} -gt 0 ]]; then
     PI_CMD+=("${PI_ARGS[@]}")
 fi
@@ -62,6 +62,7 @@ PI_CMD+=(/bs-task)
 if [[ -n "$ISSUE_ID" ]]; then
     PI_CMD+=("$ISSUE_ID")
 fi
+PI_CMD+=(--bs-single-shot)
 
 set +e
 "${PI_CMD[@]}"

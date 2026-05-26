@@ -130,10 +130,11 @@ describe("bin/bs-run", () => {
 		fix = setupFakes({ piExit: 0, mergeExit: 0 });
 		const r = runBsRun(fix, []);
 		expect(r.status).toBe(0);
-		expect(r.log).toMatch(/pi .*--bs-single-shot/);
-		expect(r.log).toMatch(/pi .*\/bs-task/);
-		expect(r.log).toMatch(/merge --once/);
 		const piLine = r.log.split("\n").find((l) => l.startsWith("pi "))!;
+		// /bs-task must appear before --bs-single-shot so pi's greedy unknown-flag
+		// parser doesn't consume /bs-task as the value of --bs-single-shot.
+		expect(piLine).toMatch(/\/bs-task .*--bs-single-shot|\/bs-task --bs-single-shot/);
+		expect(r.log).toMatch(/merge --once/);
 		expect(piLine).not.toMatch(/\/bs-task \d/);
 	});
 
@@ -141,7 +142,8 @@ describe("bin/bs-run", () => {
 		fix = setupFakes({ piExit: 0, mergeExit: 0 });
 		const r = runBsRun(fix, ["42"]);
 		expect(r.status).toBe(0);
-		expect(r.log).toMatch(/pi .*--bs-single-shot .*\/bs-task 42/);
+		const piLine = r.log.split("\n").find((l) => l.startsWith("pi "))!;
+		expect(piLine).toMatch(/\/bs-task 42 .*--bs-single-shot|\/bs-task 42 --bs-single-shot/);
 		expect(r.log).toMatch(/merge --once/);
 	});
 
@@ -150,7 +152,7 @@ describe("bin/bs-run", () => {
 		const r = runBsRun(fix, ["--", "--bs-plan-model", "foo/bar"]);
 		expect(r.status).toBe(0);
 		expect(r.log).toMatch(
-			/pi .*--bs-single-shot --bs-plan-model foo\/bar \/bs-task/,
+			/pi .*--bs-plan-model foo\/bar \/bs-task.*--bs-single-shot/,
 		);
 	});
 
@@ -159,7 +161,7 @@ describe("bin/bs-run", () => {
 		const r = runBsRun(fix, ["42", "--", "--bs-impl-model", "foo/bar"]);
 		expect(r.status).toBe(0);
 		expect(r.log).toMatch(
-			/pi .*--bs-single-shot --bs-impl-model foo\/bar \/bs-task 42/,
+			/pi .*--bs-impl-model foo\/bar \/bs-task 42.*--bs-single-shot/,
 		);
 	});
 
