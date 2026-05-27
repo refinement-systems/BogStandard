@@ -251,8 +251,9 @@ vitest.config.ts
 tsconfig.json                  # For IDE type checking (noEmit)
 spec/
   tla/
-    BogStandard.tla            # TLA+ spec of the /bs-task phase state machine
-    BogStandard.cfg            # TLC invariant configuration
+    BogStandard.tla              # TLA+ spec of the /bs-task phase state machine
+    BogStandard.cfg              # TLC config: long-running workers (dispatch.sh)
+    BogStandard_SingleShot.cfg   # TLC config: single-shot workers (bs-run)
 tools/
   macos/
     find-tla-tools.sh          # Sourced helper: exports TLA_TOOLS and JAVA
@@ -262,40 +263,70 @@ tools/
 
 ## TLA+ specification
 
-`spec/tla/BogStandard.tla` models the `/bs-task` phase machine across N
-concurrent workers, plus an abstract per-issue git state. The v1 model
-covers the nine DB phases from `db.ts:66-77` (drafting and archived are
-out of scope — issues are born `ready`), the conditional-UPDATE
-transition pattern in `transitionPhase`, claim-on-ownership, the TDD
-red/green/bail loop, and the eligibility predicate from
-`issue-picker.ts`.
+`spec/tla/BogStandard.tla` models the `/bs-task` phase machine across
+two concurrent workers, plus an abstract per-issue git state and an
+optional single-shot worker-lifetime model.
 
-Default config: two workers, two issues (`i1` no-tests, `i2` TDD), `i1`
-blocks `i2`, `MAX_BAILS = 2`. With the bug-exhibit invariant disabled
-(see below), the spec has 41 reachable states at depth 19; TLC finishes
-in about a second.
+Topology is hardcoded: workers `w1` and `w2`, issues `i1` (no-tests)
+and `i2` (TDD), `i1` blocks `i2`, `MAX_BAILS = 2`. TLC finishes in
+about a second against either config.
+
+### What's modeled
+
+- The phase set from `db.ts:70` (minus `drafting` and `archived`).
+- The atomic conditional-UPDATE transition pattern in `transitionPhase`
+  (`db.ts:817`) and the claim-on-ownership protocol in `claimIssue`
+  (`db.ts:987`).
+- The TDD red/green/bail loop bounded by `MAX_BAILS`: `red_planning →
+  red_impl → green_planning → green_impl`, with `BailGreen` looping
+  back to `red_planning` (`finalizeRedImplementation` at
+  `index.ts:1013`, `handleBail` at `index.ts:1078`).
+- Eligibility from `issue-picker.ts:46`: a `ready` blocker counts as
+  unresolved.
+- Worker → merge-daemon handoff (`PublishRef`) and the merge daemon's
+  outcomes: `MergeStart`, `MergeSucceed`, `MergeConflict`, `RepairFix`,
+  `RepairBail`. `done` means the issue's ref has actually been merged
+  to `main`.
+- The no-changes close path (`NoChangesClose`): a working-phase issue
+  with a clean tree and no commits ahead can go directly to `done`
+  without touching `main_committed`.
+- The "Not done, quitting" path (`WipQuit`): an issue's owner is
+  cleared without changing its phase, leaving it claimable again
+  (`index.ts:965`).
+- Single-shot mode (`SINGLE_SHOT = TRUE`): each worker's pi process
+  exits after one terminal boundary. Models the `bs-run` wrapper and
+  the boundaries in `single-shot.ts` / `maybeShutdown` call sites in
+  `index.ts`. Captured by `worker_active`, by `ReleaseWorker` folded
+  into every worker-releasing action, and by `WorkerGiveUp` for
+  pre-claim early exits.
 
 ### Safety invariants
 
 - `TypeOK`, `MutualExclusion`, `OneIssuePerWorker`, `PhaseShapeOK`,
-  `BailBound` — sanity checks; all hold.
-- `MergeSoundness` — **intentionally fails on v1.** It documents the
-  `dispatch.sh` + `closeAndCommit` bug: workers commit to per-worktree
-  branches and mark issues `done` without ever merging back to `main`,
-  so a downstream worker can plan an issue whose blocker's code is
-  still on an unmerged branch. The expected six-step counterexample is
-  `Claim(w1,i1) → StartPlanning → CompletePlanning → CompleteImpl →
-  Claim(w1,i2) → StartPlanning(i2)` — at which point i2 is in
-  `red_planning` while `main_committed = {}` even though i1 is `done`.
+  `BailBound` — structural sanity checks; all hold.
+- `MergeSoundness` — when a worker is planning issue `i`, every
+  blocker of `i` is either in `main_committed` or was closed via the
+  no-changes path. An issue handed off to the merge daemon but not
+  yet finalized is *not* an acceptable blocker.
+- `DoneImpliesResolved` — every `done` issue is in `main_committed` or
+  `closed_no_change` (catches a future "done without going through
+  either path" bug).
+- `SingleShotMonotone` — an inactive worker holds no claim. Trivial
+  in long-running mode; real in single-shot mode.
 
-### Out of scope for v1, planned for v2
+### What's still out of scope
 
-- An explicit `merging` phase between `*_impl` and `done`, plus a
-  `Merge` action that advances `main_committed`. This is the proposed
-  fix; running TLC against v2 should show `MergeSoundness` passing.
-- `Steal` (db.ts:1007) and release-without-completion paths.
-- `work_state ∈ {NoWork, OnBranch, OnMain}` per issue and `branch_base`
-  per worker, for conflict-aware reasoning about merges.
+- `Steal` (`db.ts:1024`) and the stale-heartbeat takeover.
+- The `merge_tasks` queue with `FOR UPDATE SKIP LOCKED` and the
+  step-checkpoint replay (`scripts/lib/merge-runtime.ts`); the spec's
+  merge-daemon actions fire nondeterministically rather than via
+  explicit task claims.
+- `MainIsRedError` (a daemon iteration that pre-fails on `main` and
+  leaves the issue stuck in `merging_pending`); covered implicitly by
+  `MergeStart` being optional.
+- Concrete git conflict / test details; an issue ref is either
+  unpublished, published, or merged to `main`.
+- Designer; `drafting` and `archived` phases.
 
 ## macOS tools
 
@@ -315,4 +346,9 @@ Quick start from the repo root:
 ```bash
 tools/macos/tla-check.sh       spec/tla/BogStandard.tla
 tools/macos/tla-model-check.sh spec/tla/BogStandard.tla
+tools/macos/tla-model-check.sh spec/tla/BogStandard.tla BogStandard_SingleShot.cfg
 ```
+
+The default config models long-running workers (`dispatch.sh` mode).
+The single-shot config models the `bs-run` wrapper: each worker
+exits after one terminal boundary.
