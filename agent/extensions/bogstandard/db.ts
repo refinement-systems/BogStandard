@@ -23,19 +23,28 @@
 
 import pg from "pg";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { ResolvedConfig } from "./config.js";
+import {
+	assertWorkflowId,
+	completeResolvedConfig,
+	needsTestsForWorkflowId,
+	workflowIdForNeedsTests,
+	type MinimalResolvedConfig,
+	type ResolvedConfig,
+	type WorkflowId,
+} from "./config.js";
 
 const { Pool } = pg;
 
 let activeConfig: ResolvedConfig | undefined;
 let pool: pg.Pool | undefined;
 
-export function configureDb(config: ResolvedConfig): void {
+export function configureDb(config: MinimalResolvedConfig): void {
+	const completed = completeResolvedConfig(config);
 	if (pool && activeConfig?.databaseUrl !== config.databaseUrl) {
 		void pool.end().catch(() => {});
 		pool = undefined;
 	}
-	activeConfig = config;
+	activeConfig = completed;
 }
 
 export async function resetDbForTests(): Promise<void> {
@@ -151,6 +160,7 @@ export interface IssueVersionSummary {
 	title: string;
 	description: string | null;
 	needs_tests: boolean | null;
+	workflow_id: WorkflowId | null;
 	created_at: string;
 	created_by: string | null;
 }
@@ -167,6 +177,7 @@ export interface IssueDetail {
 	priority?: string;
 	description?: string | null;
 	needs_tests?: boolean | null;
+	workflow_id?: WorkflowId | null;
 	current_version_id: number;
 	current_version_no: number;
 	current_agent_id?: string | null;
@@ -229,6 +240,7 @@ export async function issueShowJson(
 		title: string;
 		description: string | null;
 		needs_tests: boolean | null;
+		workflow_id: WorkflowId | null;
 	}>(
 		`SELECT i.id,
 		        i.phase,
@@ -239,7 +251,8 @@ export async function issueShowJson(
 		        v.version_no,
 		        v.title,
 		        v.description,
-		        v.needs_tests
+		        v.needs_tests,
+		        v.workflow_id
 		   FROM issues i
 		   JOIN issue_versions v ON v.id = i.current_version_id
 		  WHERE i.id = $1`,
@@ -273,6 +286,7 @@ export async function issueShowJson(
 		priority: row.priority,
 		description: row.description,
 		needs_tests: row.needs_tests,
+		workflow_id: normalizeWorkflowId(row.workflow_id, row.needs_tests),
 		current_version_id: Number(row.current_version_id),
 		current_version_no: row.version_no,
 		current_agent_id: row.current_agent_id,
@@ -288,10 +302,11 @@ export async function issueShowJson(
 			title: string;
 			description: string | null;
 			needs_tests: boolean | null;
+			workflow_id: WorkflowId | null;
 			created_at: Date;
 			created_by: string | null;
 		}>(
-			`SELECT id, version_no, title, description, needs_tests, created_at, created_by
+			`SELECT id, version_no, title, description, needs_tests, workflow_id, created_at, created_by
 			   FROM issue_versions
 			  WHERE issue_id = $1
 			  ORDER BY version_no`,
@@ -320,6 +335,7 @@ export async function issueShowJson(
 			title: v.title,
 			description: v.description,
 			needs_tests: v.needs_tests,
+			workflow_id: normalizeWorkflowId(v.workflow_id, v.needs_tests),
 			created_at: v.created_at.toISOString(),
 			created_by: v.created_by,
 			comments: byVersion.get(v.id) ?? [],
@@ -372,11 +388,46 @@ export function assertPriority(p: string): asserts p is Priority {
 	}
 }
 
+function normalizeWorkflowId(
+	workflowId: WorkflowId | null | undefined,
+	needsTests: boolean | null | undefined,
+): WorkflowId | null {
+	if (workflowId !== null && workflowId !== undefined) {
+		assertWorkflowId(workflowId);
+		return workflowId;
+	}
+	return workflowIdForNeedsTests(needsTests);
+}
+
+function normalizeInputWorkflowId(
+	workflowId: WorkflowId | undefined,
+	needsTests: boolean | undefined,
+): WorkflowId | null {
+	if (workflowId !== undefined) {
+		assertWorkflowId(workflowId);
+		const expectedNeedsTests = needsTestsForWorkflowId(workflowId);
+		if (needsTests !== undefined && needsTests !== expectedNeedsTests) {
+			throw new Error(
+				`workflow_id '${workflowId}' conflicts with needs_tests=${needsTests}`,
+			);
+		}
+		return workflowId;
+	}
+	return workflowIdForNeedsTests(needsTests);
+}
+
+export function workflowIdForIssue(
+	issue: Pick<IssueDetail, "workflow_id" | "needs_tests">,
+): WorkflowId | null {
+	return normalizeWorkflowId(issue.workflow_id, issue.needs_tests);
+}
+
 export interface IssueCreateInput {
 	title: string;
 	description?: string;
 	priority: string;
 	needs_tests?: boolean;
+	workflow_id?: WorkflowId;
 	/** Defaults to 'drafting'. Designer uses default; importers may pass others. */
 	phase?: Phase;
 	created_by?: string;
@@ -395,6 +446,8 @@ export async function issueCreate(
 		throw new Error("Issue title must not be empty");
 	}
 	const phase: Phase = input.phase ?? "drafting";
+	const workflowId = normalizeInputWorkflowId(input.workflow_id, input.needs_tests);
+	const needsTests = input.needs_tests ?? needsTestsForWorkflowId(workflowId);
 	const client = await getPool().connect();
 	try {
 		await client.query("BEGIN");
@@ -406,10 +459,10 @@ export async function issueCreate(
 		);
 		const issueId = Number(issueRes.rows[0].id);
 		const versionRes = await client.query<{ id: string }>(
-			`INSERT INTO issue_versions (issue_id, version_no, title, description, needs_tests, created_by)
-			      VALUES ($1, 1, $2, $3, $4, $5)
+			`INSERT INTO issue_versions (issue_id, version_no, title, description, needs_tests, workflow_id, created_by)
+			      VALUES ($1, 1, $2, $3, $4, $5, $6)
 			   RETURNING id`,
-			[issueId, input.title, input.description ?? null, input.needs_tests ?? null, input.created_by ?? null],
+			[issueId, input.title, input.description ?? null, needsTests, workflowId, input.created_by ?? null],
 		);
 		const versionId = Number(versionRes.rows[0].id);
 		await client.query(
@@ -427,8 +480,8 @@ export async function issueCreate(
 }
 
 /**
- * Promote a `drafting` issue to `ready`. Requires `needs_tests` to be set on
- * the current version — the Designer is expected to classify before promotion.
+ * Promote a `drafting` issue to `ready`. Requires `workflow_id` to be set on
+ * the current version. `needs_tests` is accepted as a legacy fallback.
  */
 export async function issuePromoteToReady(
 	_pi: ExtensionAPI,
@@ -436,8 +489,8 @@ export async function issuePromoteToReady(
 	agentId: string | null,
 ): Promise<void> {
 	const p = getPool();
-	const cur = await p.query<{ phase: Phase; current_version_id: string; needs_tests: boolean | null }>(
-		`SELECT i.phase, i.current_version_id, v.needs_tests
+	const cur = await p.query<{ phase: Phase; current_version_id: string; needs_tests: boolean | null; workflow_id: WorkflowId | null }>(
+		`SELECT i.phase, i.current_version_id, v.needs_tests, v.workflow_id
 		   FROM issues i
 		   JOIN issue_versions v ON v.id = i.current_version_id
 		  WHERE i.id = $1`,
@@ -448,8 +501,8 @@ export async function issuePromoteToReady(
 	if (row.phase !== "drafting") {
 		throw new Error(`Issue ${id} is in phase '${row.phase}', cannot promote to ready (must be 'drafting')`);
 	}
-	if (row.needs_tests === null) {
-		throw new Error(`Issue ${id} cannot be promoted: needs_tests is not set on the current version`);
+	if (normalizeWorkflowId(row.workflow_id, row.needs_tests) === null) {
+		throw new Error(`Issue ${id} cannot be promoted: workflow_id/needs_tests is not set on the current version`);
 	}
 	const client = await p.connect();
 	try {
@@ -477,6 +530,7 @@ export interface IssueUpdateInput {
 	description?: string;
 	priority?: string;
 	needs_tests?: boolean;
+	workflow_id?: WorkflowId;
 }
 
 /**
@@ -492,7 +546,8 @@ export async function issueUpdate(
 	const anyVersionField =
 		input.title !== undefined ||
 		input.description !== undefined ||
-		input.needs_tests !== undefined;
+		input.needs_tests !== undefined ||
+		input.workflow_id !== undefined;
 	const anyIssueField = input.priority !== undefined;
 	if (!anyVersionField && !anyIssueField) return;
 
@@ -511,7 +566,7 @@ export async function issueUpdate(
 		if (anyVersionField) {
 			if (phase !== "drafting") {
 				throw new Error(
-					`Issue ${id} is in phase '${phase}': title/description/needs_tests can only be edited while drafting. Use redraft_issue to change them after promotion.`,
+					`Issue ${id} is in phase '${phase}': title/description/workflow classification can only be edited while drafting. Use redraft_issue to change them after promotion.`,
 				);
 			}
 			const sets: string[] = [];
@@ -526,7 +581,17 @@ export async function issueUpdate(
 				sets.push(`description = $${params.length}`);
 			}
 			if (input.needs_tests !== undefined) {
-				params.push(input.needs_tests);
+				const workflowId = normalizeInputWorkflowId(input.workflow_id, input.needs_tests);
+				const needsTests = needsTestsForWorkflowId(workflowId) ?? input.needs_tests;
+				params.push(needsTests);
+				sets.push(`needs_tests = $${params.length}`);
+				params.push(workflowId);
+				sets.push(`workflow_id = $${params.length}`);
+			} else if (input.workflow_id !== undefined) {
+				assertWorkflowId(input.workflow_id);
+				params.push(input.workflow_id);
+				sets.push(`workflow_id = $${params.length}`);
+				params.push(needsTestsForWorkflowId(input.workflow_id));
 				sets.push(`needs_tests = $${params.length}`);
 			}
 			params.push(current_version_id);
@@ -594,6 +659,7 @@ export interface RedraftInput {
 	title: string;
 	description: string;
 	needs_tests: boolean;
+	workflow_id?: WorkflowId;
 	carry_forward_summary: string;
 	created_by?: string;
 }
@@ -615,6 +681,8 @@ export async function redraftIssue(
 	if (!input.carry_forward_summary.trim()) {
 		throw new Error("carry_forward_summary must not be empty");
 	}
+	const workflowId = normalizeInputWorkflowId(input.workflow_id, input.needs_tests);
+	const needsTests = needsTestsForWorkflowId(workflowId) ?? input.needs_tests;
 
 	const p = getPool();
 	const cur = await p.query<{ phase: Phase }>(`SELECT phase FROM issues WHERE id = $1`, [id]);
@@ -636,10 +704,10 @@ export async function redraftIssue(
 		const nextVersion = (maxRes.rows[0]?.max ?? 0) + 1;
 
 		const versionRes = await client.query<{ id: string }>(
-			`INSERT INTO issue_versions (issue_id, version_no, title, description, needs_tests, created_by)
-			      VALUES ($1, $2, $3, $4, $5, $6)
+			`INSERT INTO issue_versions (issue_id, version_no, title, description, needs_tests, workflow_id, created_by)
+			      VALUES ($1, $2, $3, $4, $5, $6, $7)
 			   RETURNING id`,
-			[id, nextVersion, input.title, input.description, input.needs_tests, input.created_by ?? agentId],
+			[id, nextVersion, input.title, input.description, needsTests, workflowId, input.created_by ?? agentId],
 		);
 		const versionId = Number(versionRes.rows[0].id);
 

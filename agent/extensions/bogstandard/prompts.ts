@@ -74,6 +74,7 @@ function renderIssueBlock(issue: IssueDetail): string {
 		priority: issue.priority,
 		description: issue.description,
 		needs_tests: issue.needs_tests,
+		workflow_id: issue.workflow_id,
 		comments: filteredComments,
 	};
 	const json = JSON.stringify(sanitized, null, 2);
@@ -85,7 +86,7 @@ function renderIssueBlock(issue: IssueDetail): string {
 		sections.push(display);
 	}
 	sections.push("---");
-	sections.push("Raw JSON (fields: title, description, priority, needs_tests, comments):");
+	sections.push("Raw JSON (fields: title, description, priority, needs_tests, workflow_id, comments):");
 	sections.push("```json");
 	sections.push(json);
 	sections.push("```");

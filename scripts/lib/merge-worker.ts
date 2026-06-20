@@ -135,13 +135,18 @@ export function assertMergeConfig(
 			`bs-merge-worker: no "merge" block in ${configPath}. Add a "merge.test_command" array, e.g. ["npm","test"].`,
 		);
 	}
-	const { testCommand, testTimeoutSeconds, stagingWorktree, repairModel } = cfg.merge;
+	const { testCommand, testTimeoutSeconds, stagingWorktree } = cfg.merge;
 	if (!testCommand || testCommand.length === 0) {
 		throw new Error(
 			`bs-merge-worker: "merge.test_command" is missing or empty in ${configPath}. ` +
 				`Set it to the command the daemon should run before and after each merge, e.g. ["npm","test"].`,
 		);
 	}
+	const repairModel =
+		cfg.worker.models.phases.merge_repair ??
+		cfg.worker.models.mergeRepair ??
+		cfg.worker.models.implement ??
+		cfg.merge.repairModel;
 	return {
 		testCommand,
 		testTimeoutSeconds,

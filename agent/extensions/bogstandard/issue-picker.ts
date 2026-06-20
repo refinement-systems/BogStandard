@@ -16,7 +16,7 @@
  *
  * Eligibility:
  *   - phase = 'ready'
- *   - current version's needs_tests is set (NOT NULL) — Designer classified it
+ *   - current version's workflow_id is set (NOT NULL) — Designer classified it
  *   - not currently claimed (current_agent_id IS NULL) or stale heartbeat
  *   - no blockers in a not-yet-resolved phase
  *
@@ -44,11 +44,11 @@ export interface QueryRunner {
 }
 
 export const ELIGIBLE_SQL = `
-	SELECT i.id, v.title, i.priority, i.phase, v.needs_tests
+	SELECT i.id, v.title, i.priority, i.phase, v.needs_tests, v.workflow_id
 	  FROM issues i
 	  JOIN issue_versions v ON v.id = i.current_version_id
 	 WHERE i.phase = 'ready'
-	   AND v.needs_tests IS NOT NULL
+	   AND v.workflow_id IS NOT NULL
 	   AND (i.current_agent_id IS NULL
 	        OR i.phase_started_at < now() - ($1::int || ' minutes')::interval)
 	   AND NOT EXISTS (
@@ -101,6 +101,7 @@ interface EligibleRow extends Record<string, unknown> {
 	priority: string;
 	phase: Phase;
 	needs_tests: boolean | null;
+	workflow_id: string | null;
 }
 
 export interface PendingMergeEntry {

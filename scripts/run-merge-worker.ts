@@ -1245,7 +1245,7 @@ export function resolveRepairModel(
 	const resolved = taskSpec ?? daemonSpec;
 	if (!resolved) {
 		throw new Error(
-			"Merge repair needs a model. Pass --bs-merge-repair-model or --bs-impl-model during /bs-task, or set merge.repair_model in .bogstandard/config.json.",
+			"Merge repair needs a model. Pass --bs-merge-repair-model or --bs-impl-model during /bs-task, or set worker.models.phases.merge_repair, worker.models.merge_repair, worker.models.implement, or merge.repair_model in .bogstandard/config.json.",
 		);
 	}
 	const slash = resolved.indexOf("/");

@@ -48,11 +48,12 @@ import {
 	issueArchive,
 	issueComment,
 	issueShowJson,
+	workflowIdForIssue,
 	type IssueDetail,
 	type IssueListEntry,
 	type Phase,
 } from "./db.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, type ModelPhase, type ResolvedConfig, type WorkerPhase } from "./config.js";
 import { addAll, commit, gitRevListCount, hasStagedChanges, headShortSha, isClean, resetHardHeadMinus1, resetHardToRef, showHeadDiff, statusShort } from "./git.js";
 import { publishWorkerBranch, routeCloseAction } from "./merge-handoff.js";
 import { findBlockCycle, formatIssueLabel, listEligible, listPendingMerges, pickFirstEligible } from "./issue-picker.js";
@@ -100,6 +101,7 @@ function implementingFor(planning: PlanningPhase): ImplementingPhase {
 export default function bogstandard(pi: ExtensionAPI) {
 	let state: BogstandardState = { ...IDLE_STATE };
 	let issue: IssueDetail | undefined;
+	let config: ResolvedConfig | undefined;
 
 	registerQuestionnaireTool(pi);
 
@@ -387,9 +389,10 @@ export default function bogstandard(pi: ExtensionAPI) {
 				return;
 			}
 
-			if (issue.needs_tests === null || issue.needs_tests === undefined) {
+			const workflowId = workflowIdForIssue(issue);
+			if (workflowId === null) {
 				ctx.ui.notify(
-					`Issue #${issue.id} is missing needs_tests classification. Run /bs-design to set it before /bs-task.`,
+					`Issue #${issue.id} is missing workflow classification. Run /bs-design to set it before /bs-task.`,
 					"error",
 				);
 				maybeShutdown(ctx, "missing_needs_tests");
@@ -420,7 +423,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 				return;
 			}
 
-			const targetPhase: PlanningPhase = issue.needs_tests ? "red_planning" : "planning";
+			const targetPhase: PlanningPhase = workflowId === "tdd" ? "red_planning" : "planning";
 
 			if (targetPhase === "red_planning") {
 				try {
@@ -594,6 +597,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		lines.push(`**Phase:** ${state.phase}`);
 		lines.push(`**Version:** v${issue.current_version_no}`);
 		lines.push(`**needs_tests:** ${issue.needs_tests === null || issue.needs_tests === undefined ? "(unset)" : String(issue.needs_tests)}`);
+		lines.push(`**workflow_id:** ${workflowIdForIssue(issue) ?? "(unset)"}`);
 		if (lastEvent) {
 			lines.push(
 				`**Last event:** ${lastEvent.phase_from ?? "(none)"} → ${lastEvent.phase_to}${lastEvent.reason ? ` — ${lastEvent.reason}` : ""}`,
@@ -1263,14 +1267,16 @@ export default function bogstandard(pi: ExtensionAPI) {
 		const broadPlan = pi.getFlag("bs-plan-model") as string | undefined;
 		const broadImpl = pi.getFlag("bs-impl-model") as string | undefined;
 		const get = (name: string) => pi.getFlag(name) as string | undefined;
+		const cfgModels = config?.worker.models;
+		const cfgPhase = (phase: ModelPhase) => cfgModels?.phases[phase];
 		switch (phase) {
-			case "planning":        return broadPlan;
-			case "implementing":    return broadImpl;
-			case "red_planning":    return get("bs-red-plan-model")   ?? broadPlan;
-			case "red_impl":        return get("bs-red-impl-model")   ?? broadImpl;
-			case "green_planning":  return get("bs-green-plan-model") ?? broadPlan;
-			case "green_impl":      return get("bs-green-impl-model") ?? broadImpl;
-			case "merge_repair":    return get("bs-merge-repair-model") ?? broadImpl;
+			case "planning":        return broadPlan ?? cfgPhase("planning") ?? cfgModels?.plan;
+			case "implementing":    return broadImpl ?? cfgPhase("implementing") ?? cfgModels?.implement;
+			case "red_planning":    return get("bs-red-plan-model")   ?? broadPlan ?? cfgPhase("red_planning")   ?? cfgModels?.plan;
+			case "red_impl":        return get("bs-red-impl-model")   ?? broadImpl ?? cfgPhase("red_impl")        ?? cfgModels?.implement;
+			case "green_planning":  return get("bs-green-plan-model") ?? broadPlan ?? cfgPhase("green_planning") ?? cfgModels?.plan;
+			case "green_impl":      return get("bs-green-impl-model") ?? broadImpl ?? cfgPhase("green_impl")      ?? cfgModels?.implement;
+			case "merge_repair":    return get("bs-merge-repair-model") ?? broadImpl ?? cfgPhase("merge_repair") ?? cfgModels?.mergeRepair ?? cfgModels?.implement ?? config?.merge?.repairModel;
 			default:                return undefined;
 		}
 	}
@@ -1295,19 +1301,56 @@ export default function bogstandard(pi: ExtensionAPI) {
 	}
 
 	function buildPhaseSystemPrompt(phase: Phase, base: string): string {
+		let prompt: string;
 		switch (phase) {
 			case "planning":
 			case "red_planning":
 			case "green_planning":
-				return buildPlannerSystemPrompt();
+				prompt = buildPlannerSystemPrompt();
+				break;
 			case "implementing":
 			case "red_impl":
-				return buildImplementerSystemPrompt();
+				prompt = buildImplementerSystemPrompt();
+				break;
 			case "green_impl":
-				return buildGreenImplementerSystemPrompt();
+				prompt = buildGreenImplementerSystemPrompt();
+				break;
 			default:
 				return base;
 		}
+		return applySystemPromptOverride(phase, prompt);
+	}
+
+	function applySystemPromptOverride(phase: WorkerPhase, base: string): string {
+		const override = config?.worker.prompts[phase];
+		if (!override) return base;
+		return [
+			override.systemPrepend,
+			base,
+			override.systemAppend,
+		].filter((part): part is string => part !== undefined && part !== "").join("\n\n");
+	}
+
+	function applyUserPromptOverride(phase: Phase, base: string): string {
+		if (!isWorkerPhase(phase)) return base;
+		const override = config?.worker.prompts[phase];
+		if (!override) return base;
+		return [
+			override.userPrepend,
+			base,
+			override.userAppend,
+		].filter((part): part is string => part !== undefined && part !== "").join("\n\n");
+	}
+
+	function isWorkerPhase(phase: Phase): phase is WorkerPhase {
+		return (
+			phase === "planning" ||
+			phase === "implementing" ||
+			phase === "red_planning" ||
+			phase === "red_impl" ||
+			phase === "green_planning" ||
+			phase === "green_impl"
+		);
 	}
 
 	function customTypeForPhase(phase: Phase): string {
@@ -1329,6 +1372,7 @@ export default function bogstandard(pi: ExtensionAPI) {
 		content: string,
 		tools: string[],
 	): Promise<void> {
+		content = applyUserPromptOverride(phase, content);
 		state.lastPrompt = content;
 		await switchModelForPhase(ctx, phase);
 		pi.setActiveTools(tools);
@@ -1368,13 +1412,12 @@ export default function bogstandard(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		try {
-			configureDb(
-				loadConfig({
-					projectRoot: process.cwd(),
-					flagDatabaseUrl: pi.getFlag("bs-database-url") as string | undefined,
-					flagAgentId: pi.getFlag("bs-agent-id") as string | undefined,
-				}),
-			);
+			config = loadConfig({
+				projectRoot: process.cwd(),
+				flagDatabaseUrl: pi.getFlag("bs-database-url") as string | undefined,
+				flagAgentId: pi.getFlag("bs-agent-id") as string | undefined,
+			});
+			configureDb(config);
 		} catch (err) {
 			ctx.ui.notify(
 				`/bs-task: postgres configuration not loaded — ${err instanceof Error ? err.message : String(err)}. Run 'bs-setup' to create .bogstandard/config.json.`,

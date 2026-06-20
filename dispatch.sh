@@ -96,9 +96,9 @@ if [[ "$N" -eq 0 ]]; then
 fi
 
 # --- read parent config ------------------------------------------------------
-# We need the database_url so we can stamp each worker config.json with the
-# same connection. The agent_id is overridden per worker, so we ignore the
-# parent's value here.
+# We validate database_url up front. Per-worker config preserves the parent
+# config (worker models/prompts, merge settings, etc.) and only overrides
+# agent_id below.
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "error: ${CONFIG_FILE} not found." >&2
@@ -107,7 +107,6 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 fi
 
 DATABASE_URL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('${CONFIG_FILE}','utf8')).database_url)")
-STALE_TIMEOUT=$(node -e "const c=JSON.parse(require('fs').readFileSync('${CONFIG_FILE}','utf8')); console.log(c.stale_lock_timeout_minutes ?? 60)")
 
 if [[ -z "$DATABASE_URL" || "$DATABASE_URL" == "undefined" ]]; then
     echo "error: ${CONFIG_FILE} has no database_url" >&2
@@ -152,13 +151,13 @@ while IFS= read -r issue_id; do
     # .bogstandard directory is gitignored so it stays out of the worktree's
     # commit history.
     mkdir -p "${WORKTREE}/.bogstandard"
-    cat > "${WORKTREE}/.bogstandard/config.json" <<EOF
-{
-  "database_url": "${DATABASE_URL}",
-  "agent_id": "${AGENT_ID}",
-  "stale_lock_timeout_minutes": ${STALE_TIMEOUT}
-}
-EOF
+    node -e '
+const fs = require("fs");
+const [src, dest, agentId] = process.argv.slice(1);
+const config = JSON.parse(fs.readFileSync(src, "utf8"));
+config.agent_id = agentId;
+fs.writeFileSync(dest, `${JSON.stringify(config, null, 2)}\n`);
+' "$CONFIG_FILE" "${WORKTREE}/.bogstandard/config.json" "$AGENT_ID"
 
     # Build the pi invocation. --bs-issue-id pre-assigns the issue so workers
     # don't race for the auto-pick.

@@ -35,7 +35,7 @@ The wrapper creates the database if missing, runs `db/migrations/0001_init.sql`,
 | `BOGSTANDARD_DATABASE_URL` | `database_url` | Env override |
 | `--bs-agent-id <id>` | `agent_id` | Per-invocation |
 | `BOGSTANDARD_AGENT_ID` | `agent_id` | Env override |
-| `.bogstandard/config.json` | `database_url`, `agent_id`, `stale_lock_timeout_minutes` | Default for the project |
+| `.bogstandard/config.json` | `config_version`, `database_url`, `agent_id`, `stale_lock_timeout_minutes`, `worker`, `merge` | Default for the project |
 
 ## Importing from an existing chainlink project
 
@@ -201,6 +201,7 @@ db/
     0004_drop_parent_id.sql    # Collapse parent_id into dependencies; verify acyclic
     0005_merge_phases.sql      # Merge-flow phases + issue_branches handoff table
     0006_merge_queue.sql       # merge_tasks + merge_task_steps for the merge daemon
+    0007_workflow_id.sql       # Explicit workflow_id backfill from legacy needs_tests
 scripts/
   setup.ts                     # Create DB if missing, apply schema, write config.json
   migrate.ts                   # Apply pending node-pg-migrate migrations

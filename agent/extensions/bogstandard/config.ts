@@ -32,6 +32,58 @@ export const DEFAULT_AGENT_ID = "main";
 export const DEFAULT_STALE_LOCK_TIMEOUT_MINUTES = 60;
 export const DEFAULT_MERGE_STAGING_WORKTREE = ".bogstandard/merge-staging";
 export const DEFAULT_MERGE_TEST_TIMEOUT_SECONDS = 600;
+export const CURRENT_CONFIG_VERSION = 1;
+
+export type WorkflowId = "direct" | "tdd";
+export type WorkerPhase =
+	| "planning"
+	| "implementing"
+	| "red_planning"
+	| "red_impl"
+	| "green_planning"
+	| "green_impl";
+export type ModelPhase = WorkerPhase | "merge_repair";
+
+const WORKFLOW_IDS: readonly WorkflowId[] = ["direct", "tdd"];
+const MODEL_PHASES: readonly ModelPhase[] = [
+	"planning",
+	"implementing",
+	"red_planning",
+	"red_impl",
+	"green_planning",
+	"green_impl",
+	"merge_repair",
+];
+const WORKER_PHASES: readonly WorkerPhase[] = [
+	"planning",
+	"implementing",
+	"red_planning",
+	"red_impl",
+	"green_planning",
+	"green_impl",
+];
+
+export function workflowIdForNeedsTests(
+	needsTests: boolean | null | undefined,
+): WorkflowId | null {
+	if (needsTests === true) return "tdd";
+	if (needsTests === false) return "direct";
+	return null;
+}
+
+export function needsTestsForWorkflowId(
+	workflowId: WorkflowId | null | undefined,
+): boolean | null {
+	if (workflowId === "tdd") return true;
+	if (workflowId === "direct") return false;
+	return null;
+}
+
+export function assertWorkflowId(value: string): asserts value is WorkflowId {
+	if (!(WORKFLOW_IDS as readonly string[]).includes(value)) {
+		throw new Error(`Invalid workflow_id '${value}'. Must be one of: ${WORKFLOW_IDS.join(", ")}`);
+	}
+}
 
 /**
  * Merge-flow configuration. Consumed by `bs-merge-worker`; the rest of the
@@ -54,17 +106,59 @@ export interface MergeConfig {
 	repairModel?: string;
 }
 
+export interface WorkerModelsFileConfig {
+	plan?: string;
+	implement?: string;
+	merge_repair?: string;
+	phases?: Partial<Record<ModelPhase, string>>;
+}
+
+export interface WorkerModelsConfig {
+	plan?: string;
+	implement?: string;
+	mergeRepair?: string;
+	phases: Partial<Record<ModelPhase, string>>;
+}
+
+export interface PromptOverrideFileConfig {
+	system_prepend?: string;
+	system_append?: string;
+	user_prepend?: string;
+	user_append?: string;
+}
+
+export interface PromptOverrideConfig {
+	systemPrepend?: string;
+	systemAppend?: string;
+	userPrepend?: string;
+	userAppend?: string;
+}
+
+export interface WorkerFileConfig {
+	models?: WorkerModelsFileConfig;
+	prompts?: Partial<Record<WorkerPhase, PromptOverrideFileConfig>>;
+}
+
+export interface WorkerConfig {
+	models: WorkerModelsConfig;
+	prompts: Partial<Record<WorkerPhase, PromptOverrideConfig>>;
+}
+
 export interface FileConfig {
+	config_version?: number;
 	database_url?: string;
 	agent_id?: string;
 	stale_lock_timeout_minutes?: number;
 	merge?: MergeFileConfig;
+	worker?: WorkerFileConfig;
 }
 
 export interface ResolvedConfig {
+	configVersion: number;
 	databaseUrl: string;
 	agentId: string;
 	staleLockTimeoutMinutes: number;
+	worker: WorkerConfig;
 	/**
 	 * Optional at the type level so non-merge callers (the orchestrator, the
 	 * Designer, setup) don't need to construct one in tests. `bs-merge-worker`
@@ -73,11 +167,27 @@ export interface ResolvedConfig {
 	merge?: MergeConfig;
 }
 
+export type MinimalResolvedConfig =
+	Pick<ResolvedConfig, "databaseUrl" | "agentId" | "staleLockTimeoutMinutes"> &
+	Partial<Pick<ResolvedConfig, "configVersion" | "worker" | "merge">>;
+
 export interface ConfigSources {
 	flagDatabaseUrl?: string;
 	flagAgentId?: string;
 	env?: { BOGSTANDARD_DATABASE_URL?: string; BOGSTANDARD_AGENT_ID?: string };
 	file?: FileConfig;
+}
+
+export function completeResolvedConfig(input: MinimalResolvedConfig): ResolvedConfig {
+	const out: ResolvedConfig = {
+		configVersion: normalizeConfigVersion(input.configVersion),
+		databaseUrl: input.databaseUrl,
+		agentId: input.agentId,
+		staleLockTimeoutMinutes: input.staleLockTimeoutMinutes,
+		worker: input.worker ?? normalizeWorkerConfig(undefined),
+	};
+	if (input.merge !== undefined) out.merge = input.merge;
+	return out;
 }
 
 /**
@@ -102,7 +212,13 @@ export function resolveConfig(sources: ConfigSources): ResolvedConfig {
 	const staleLockTimeoutMinutes =
 		file.stale_lock_timeout_minutes ?? DEFAULT_STALE_LOCK_TIMEOUT_MINUTES;
 
-	const resolved: ResolvedConfig = { databaseUrl, agentId, staleLockTimeoutMinutes };
+	const resolved: ResolvedConfig = {
+		configVersion: normalizeConfigVersion(file.config_version),
+		databaseUrl,
+		agentId,
+		staleLockTimeoutMinutes,
+		worker: normalizeWorkerConfig(file.worker),
+	};
 	if (file.merge !== undefined) {
 		resolved.merge = {
 			testCommand: file.merge.test_command,
@@ -112,6 +228,63 @@ export function resolveConfig(sources: ConfigSources): ResolvedConfig {
 		};
 	}
 	return resolved;
+}
+
+function normalizeConfigVersion(value: number | undefined): number {
+	if (value === undefined) return CURRENT_CONFIG_VERSION;
+	if (value !== CURRENT_CONFIG_VERSION) {
+		throw new Error(
+			`Unsupported .bogstandard/config.json config_version ${value}; this BogStandard supports ${CURRENT_CONFIG_VERSION}.`,
+		);
+	}
+	return value;
+}
+
+function normalizeWorkerConfig(input: WorkerFileConfig | undefined): WorkerConfig {
+	return {
+		models: normalizeWorkerModels(input?.models),
+		prompts: normalizePromptOverrides(input?.prompts),
+	};
+}
+
+function normalizeWorkerModels(input: WorkerModelsFileConfig | undefined): WorkerModelsConfig {
+	const phases: Partial<Record<ModelPhase, string>> = {};
+	for (const [phase, spec] of Object.entries(input?.phases ?? {})) {
+		assertKnownPhase(phase, MODEL_PHASES, "worker.models.phases");
+		if (spec !== undefined) phases[phase] = spec;
+	}
+	const out: WorkerModelsConfig = { phases };
+	if (input?.plan !== undefined) out.plan = input.plan;
+	if (input?.implement !== undefined) out.implement = input.implement;
+	if (input?.merge_repair !== undefined) out.mergeRepair = input.merge_repair;
+	return out;
+}
+
+function normalizePromptOverrides(
+	input: WorkerFileConfig["prompts"] | undefined,
+): WorkerConfig["prompts"] {
+	const out: WorkerConfig["prompts"] = {};
+	for (const [phase, override] of Object.entries(input ?? {})) {
+		assertKnownPhase(phase, WORKER_PHASES, "worker.prompts");
+		if (override === undefined) continue;
+		out[phase] = {
+			systemPrepend: override.system_prepend,
+			systemAppend: override.system_append,
+			userPrepend: override.user_prepend,
+			userAppend: override.user_append,
+		};
+	}
+	return out;
+}
+
+function assertKnownPhase<T extends string>(
+	phase: string,
+	allowed: readonly T[],
+	path: string,
+): asserts phase is T {
+	if (!(allowed as readonly string[]).includes(phase)) {
+		throw new Error(`Unknown phase '${phase}' in ${path}; expected one of: ${allowed.join(", ")}`);
+	}
 }
 
 /**

@@ -237,6 +237,7 @@ describe("resolveRepairModel", () => {
 
 	it("throws when no repair model is configured", () => {
 		expect(() => resolveRepairModel(undefined)).toThrow(/bs-merge-repair-model/);
+		expect(() => resolveRepairModel(undefined)).toThrow(/worker\.models\.phases\.merge_repair/);
 		expect(() => resolveRepairModel(undefined)).toThrow(/merge\.repair_model/);
 	});
 

@@ -13,6 +13,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+	CURRENT_CONFIG_VERSION,
 	DEFAULT_AGENT_ID,
 	DEFAULT_MERGE_STAGING_WORKTREE,
 	DEFAULT_MERGE_TEST_TIMEOUT_SECONDS,
@@ -90,6 +91,19 @@ describe("resolveConfig precedence", () => {
 			resolveConfig({ flagDatabaseUrl: "postgres://x" }).staleLockTimeoutMinutes,
 		).toBe(DEFAULT_STALE_LOCK_TIMEOUT_MINUTES);
 	});
+
+	it("normalizes missing config_version to the current version", () => {
+		expect(resolveConfig({ flagDatabaseUrl: "postgres://x" }).configVersion).toBe(CURRENT_CONFIG_VERSION);
+	});
+
+	it("rejects unsupported config_version values", () => {
+		expect(() =>
+			resolveConfig({
+				flagDatabaseUrl: "postgres://x",
+				file: { config_version: 999 },
+			}),
+		).toThrow(/Unsupported .*config_version/);
+	});
 });
 
 describe("resolveConfig merge block", () => {
@@ -149,5 +163,93 @@ describe("resolveConfig merge block", () => {
 		expect(out.merge?.testTimeoutSeconds).toBe(DEFAULT_MERGE_TEST_TIMEOUT_SECONDS);
 		expect(out.merge?.stagingWorktree).toBe(DEFAULT_MERGE_STAGING_WORKTREE);
 		expect(out.merge?.repairModel).toBeUndefined();
+	});
+});
+
+describe("resolveConfig worker block", () => {
+	it("defaults worker models and prompt overrides to empty objects", () => {
+		const out = resolveConfig({ flagDatabaseUrl: "postgres://x" });
+		expect(out.worker.models).toEqual({ phases: {} });
+		expect(out.worker.prompts).toEqual({});
+	});
+
+	it("normalizes broad and phase-specific worker model defaults", () => {
+		const out = resolveConfig({
+			flagDatabaseUrl: "postgres://x",
+			file: {
+				worker: {
+					models: {
+						plan: "provider/planner",
+						implement: "provider/impl",
+						merge_repair: "provider/repair",
+						phases: {
+							red_planning: "provider/red-plan",
+							green_impl: "provider/green-impl",
+						},
+					},
+				},
+			},
+		});
+		expect(out.worker.models.plan).toBe("provider/planner");
+		expect(out.worker.models.implement).toBe("provider/impl");
+		expect(out.worker.models.mergeRepair).toBe("provider/repair");
+		expect(out.worker.models.phases.red_planning).toBe("provider/red-plan");
+		expect(out.worker.models.phases.green_impl).toBe("provider/green-impl");
+	});
+
+	it("normalizes prompt override snake_case keys", () => {
+		const out = resolveConfig({
+			flagDatabaseUrl: "postgres://x",
+			file: {
+				worker: {
+					prompts: {
+						planning: {
+							system_prepend: "system before",
+							system_append: "system after",
+							user_prepend: "user before",
+							user_append: "user after",
+						},
+					},
+				},
+			},
+		});
+		expect(out.worker.prompts.planning).toEqual({
+			systemPrepend: "system before",
+			systemAppend: "system after",
+			userPrepend: "user before",
+			userAppend: "user after",
+		});
+	});
+
+	it("rejects unknown worker prompt phases", () => {
+		expect(() =>
+			resolveConfig({
+				flagDatabaseUrl: "postgres://x",
+				file: {
+					worker: {
+						prompts: {
+							banana: { user_append: "x" },
+						} as never,
+					},
+				},
+			}),
+		).toThrow(/Unknown phase 'banana'/);
+	});
+
+	it("rejects unknown worker model phases", () => {
+		expect(() =>
+			resolveConfig({
+				flagDatabaseUrl: "postgres://x",
+				file: {
+					worker: {
+						models: {
+							phases: {
+								banana: "provider/model",
+							} as never,
+						},
+					},
+				},
+			}),
+		).toThrow(/Unknown phase 'banana'/);
 	});
 });

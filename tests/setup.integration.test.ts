@@ -76,6 +76,7 @@ describe("writeConfig", () => {
 		expect(path).toBe(resolve(projectRoot, ".bogstandard/config.json"));
 		const parsed = JSON.parse(readFileSync(path, "utf8"));
 		expect(parsed).toEqual({
+			config_version: 1,
 			database_url: "postgres://localhost/foo",
 			agent_id: "alpha",
 			stale_lock_timeout_minutes: 30,
@@ -90,6 +91,7 @@ describe("writeConfig", () => {
 		const projectRoot = mkdtempSync(join(tmp, "p-"));
 		const path = writeConfig(projectRoot, { databaseUrl: "postgres://localhost/foo" }, false);
 		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		expect(parsed.config_version).toBe(1);
 		expect(parsed.agent_id).toBe("main");
 		expect(parsed.stale_lock_timeout_minutes).toBe(60);
 	});

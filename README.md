@@ -77,6 +77,44 @@ The extension and scripts read `.bogstandard/config.json` for the postgres conne
 2. Env vars: `BOGSTANDARD_DATABASE_URL`, `BOGSTANDARD_AGENT_ID`
 3. `.bogstandard/config.json`
 
+New configs include `"config_version": 1`. Missing `config_version` is treated as v1 for old checkouts, but unsupported future versions are rejected.
+
+Worker model defaults and prompt overlays can also live in the file:
+
+```json
+{
+  "config_version": 1,
+  "database_url": "postgres://localhost:5432/bogstandard_myproject",
+  "agent_id": "main",
+  "stale_lock_timeout_minutes": 60,
+  "worker": {
+    "models": {
+      "plan": "openrouter/deepseek/deepseek-v4-flash",
+      "implement": "anthropic/claude-sonnet-4-6",
+      "merge_repair": "anthropic/claude-sonnet-4-6",
+      "phases": {
+        "red_planning": "openrouter/deepseek/deepseek-v4-flash",
+        "green_impl": "anthropic/claude-sonnet-4-6"
+      }
+    },
+    "prompts": {
+      "planning": {
+        "system_append": "Project-specific planning guidance.",
+        "user_append": "Include the expected verification command in the plan."
+      }
+    }
+  },
+  "merge": {
+    "test_command": ["npm", "test"],
+    "test_timeout_seconds": 600
+  }
+}
+```
+
+Prompt overlays support `system_prepend`, `system_append`, `user_prepend`, and `user_append` for `planning`, `implementing`, `red_planning`, `red_impl`, `green_planning`, and `green_impl`. They wrap the built-in prompts; they do not replace the phase graph.
+
+Schema migration `0007_workflow_id` adds `issue_versions.workflow_id` and backfills existing classified issues: `needs_tests=false → workflow_id='direct'`, `needs_tests=true → workflow_id='tdd'`, and `needs_tests=NULL` remains unclassified.
+
 ## Usage
 
 Run from inside a project that has been set up. The `bs-run` wrapper is the normal "work one issue" entry point — it runs the worker until it reaches a terminal boundary, then lands any queued merge:
@@ -157,6 +195,8 @@ pi -e ./agent/extensions/bogstandard \
 
 Flag format: `provider/model-id`. For OpenRouter models use `openrouter/` as prefix: `openrouter/deepseek/deepseek-v4-flash`. Set `OPENROUTER_API_KEY` in your environment so pi can authenticate.
 
+CLI model flags override `.bogstandard/config.json` model defaults.
+
 ### Crash recovery / resume
 
 ```bash
@@ -188,7 +228,7 @@ Workers run inside a tmux session named `bogstandard-dispatch-<pid>`. Detach wit
 
 `bs-merge-worker` lands completed issue refs through the detached `.bogstandard/merge-staging` worktree. During finalization it advances `refs/heads/main`, records the issue as `done`, and deletes the issue handoff ref.
 
-If a merge conflict or post-merge test failure needs agent repair, the daemon uses the repair model passed in the handoff task from `/bs-task` (`--bs-merge-repair-model`, falling back to `--bs-impl-model`). For manually enqueued or retried merge tasks without params, set `"merge.repair_model": "provider/model-id"` in `.bogstandard/config.json`. There is no built-in default repair model.
+If a merge conflict or post-merge test failure needs agent repair, the daemon uses the repair model passed in the handoff task from `/bs-task` (`--bs-merge-repair-model`, falling back to `--bs-impl-model`, then file-backed worker model defaults). For manually enqueued or retried merge tasks without params, set `"worker.models.phases.merge_repair"`, `"worker.models.merge_repair"`, `"worker.models.implement"`, or the legacy `"merge.repair_model"` in `.bogstandard/config.json`. There is no built-in default repair model.
 
 If another worktree has `main` checked out, Git leaves that checkout's files and index at the old tree when the daemon advances the branch ref. The merge worker now syncs those attached `main` checkouts automatically only when it can prove they are safe:
 

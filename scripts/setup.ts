@@ -37,7 +37,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import pg from "pg";
-import { DEFAULT_MERGE_STAGING_WORKTREE } from "../agent/extensions/bogstandard/config.js";
+import { CURRENT_CONFIG_VERSION, DEFAULT_MERGE_STAGING_WORKTREE } from "../agent/extensions/bogstandard/config.js";
 import { applyMigrations } from "./lib/migrations.js";
 import {
 	isStagingWorktreeRegistered,
@@ -153,6 +153,7 @@ export function writeConfig(
 	}
 	mkdirSync(dir, { recursive: true });
 	const body = {
+		config_version: CURRENT_CONFIG_VERSION,
 		database_url: args.databaseUrl,
 		agent_id: args.agentId ?? "main",
 		stale_lock_timeout_minutes: args.staleLockTimeoutMinutes ?? 60,
@@ -167,7 +168,7 @@ export function writeConfig(
 		`  ! Edit ${path} → "merge.test_command" to match this project before running bs-merge-worker.`,
 	);
 	console.log(
-		`  ! If merge repair should run from the daemon without /bs-task model flags, set "merge.repair_model" explicitly.`,
+		`  ! If merge repair should run from the daemon without /bs-task model flags, set "worker.models.phases.merge_repair" explicitly.`,
 	);
 	return path;
 }

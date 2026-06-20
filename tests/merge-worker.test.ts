@@ -28,13 +28,13 @@ import {
 	parseWorktreesPorcelain,
 	stagingWorktreeMissingMessage,
 } from "../scripts/lib/merge-worker.js";
-import type { ResolvedConfig } from "../agent/extensions/bogstandard/config.js";
+import { completeResolvedConfig, type ResolvedConfig } from "../agent/extensions/bogstandard/config.js";
 
-const baseCfg: ResolvedConfig = {
+const baseCfg: ResolvedConfig = completeResolvedConfig({
 	databaseUrl: "postgres://localhost/bs_test",
 	agentId: "main",
 	staleLockTimeoutMinutes: 60,
-};
+});
 
 // ── parseWorktreesPorcelain ─────────────────────────────────────────────────
 
@@ -230,6 +230,49 @@ describe("assertMergeConfig", () => {
 			stagingWorktree: ".bogstandard/merge-staging",
 			repairModel: "test/repair",
 		});
+	});
+
+	it("uses worker merge_repair defaults before legacy merge.repair_model", () => {
+		const cfg: ResolvedConfig = {
+			...baseCfg,
+			worker: {
+				...baseCfg.worker,
+				models: {
+					...baseCfg.worker.models,
+					implement: "test/impl",
+					mergeRepair: "test/worker-repair",
+					phases: { merge_repair: "test/phase-repair" },
+				},
+			},
+			merge: {
+				testCommand: ["npm", "test"],
+				testTimeoutSeconds: 600,
+				stagingWorktree: ".bogstandard/merge-staging",
+				repairModel: "test/legacy-repair",
+			},
+		};
+		expect(assertMergeConfig(cfg, configPath).repairModel).toBe("test/phase-repair");
+	});
+
+	it("falls back to broad worker implement model before legacy merge.repair_model", () => {
+		const cfg: ResolvedConfig = {
+			...baseCfg,
+			worker: {
+				...baseCfg.worker,
+				models: {
+					...baseCfg.worker.models,
+					implement: "test/impl",
+					phases: {},
+				},
+			},
+			merge: {
+				testCommand: ["npm", "test"],
+				testTimeoutSeconds: 600,
+				stagingWorktree: ".bogstandard/merge-staging",
+				repairModel: "test/legacy-repair",
+			},
+		};
+		expect(assertMergeConfig(cfg, configPath).repairModel).toBe("test/impl");
 	});
 });
 

@@ -133,10 +133,12 @@ four-element set are rejected by both `assertPriority` (JS guard) and
 the column CHECK constraint. The enum has total order
 `critical > high > medium > low`, used by the picker.
 
-**Contract 3.1.3 (needs_tests).** Promotion from `drafting` to `ready`
-requires `needs_tests` to be non-null. The picker also requires
-`needs_tests IS NOT NULL` — chainlink-imported rows that are
-`drafting` with null `needs_tests` are not eligible until classified.
+**Contract 3.1.3 (workflow classification).** Promotion from `drafting`
+to `ready` requires workflow classification. `workflow_id` is canonical;
+legacy `needs_tests` values are accepted and normalized to `direct` or
+`tdd`. The picker requires `workflow_id IS NOT NULL` — chainlink-imported
+rows and fresh drafts with null classification are not eligible until
+classified.
 
 **Contract 3.1.4 (phase_started_at).** Reset on *every* transition by
 `transitionPhase`. Heartbeats via `appendPhaseEvent` do **not** touch
@@ -330,7 +332,7 @@ model omits (`drafting`, `archived`):
 | Phase | Held by | Terminal? | Notes |
 |---|---|---|---|
 | `drafting` | (none) | No | Newly created via Designer; pre-classification |
-| `ready` | (none) | No | Eligible for the picker once `needs_tests IS NOT NULL` |
+| `ready` | (none) | No | Eligible for the picker once `workflow_id IS NOT NULL` |
 | `planning` | Worker | No | No-tests plan |
 | `implementing` | Worker | No | No-tests impl |
 | `red_planning` | Worker | No | TDD plan for failing tests |
@@ -507,7 +509,8 @@ truth for which issue a worker picks next.
 An issue is eligible iff **all** of the following hold:
 
 1. `phase = 'ready'`.
-2. `needs_tests IS NOT NULL` (classification done).
+2. `workflow_id IS NOT NULL` (classification done; migration 0007
+   backfills legacy `needs_tests` values).
 3. Either it has no blockers, or every blocker is in a *resolved*
    phase. Resolved phases are `done` and `archived` (the TLA+ model
    does not track `archived` and treats only `done` as resolved; the
@@ -1093,6 +1096,7 @@ Applied in numeric order, recorded one row per applied file in
 | 0004 drop parent_id | Backfills each `parent_id` edge into `dependencies` (child blocks parent). Pre-existing duplicate edges absorbed by ON CONFLICT. Detects cycles after backfill; **raises and rolls back** if any cycle exists. Drops `parent_id` and its index only after a clean cycle check. |
 | 0005 merge phases | Extends `issues.phase` CHECK with merge-flow values. Creates `issue_branches`. |
 | 0006 merge queue | Creates `merge_tasks` and `merge_task_steps`. |
+| 0007 workflow id | Adds nullable `issue_versions.workflow_id`; backfills `needs_tests=false` to `direct`, `needs_tests=true` to `tdd`, leaves null classifications null, and constrains values to the built-in workflow ids. |
 
 **Contract 10.3.1 (idempotent applyMigrations).** A second invocation
 with no new files added applies nothing. A custom `migrations/`

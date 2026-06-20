@@ -30,6 +30,7 @@ interface Row {
 	priority: string;
 	phase: Phase;
 	needs_tests: boolean | null;
+	workflow_id: string | null;
 }
 
 function runnerReturning(rows: Row[]): QueryRunner & { lastSql?: string; lastParams?: unknown[] } {
@@ -72,8 +73,8 @@ describe("listEligibleWith", () => {
 		expect(ELIGIBLE_SQL).toMatch(/i\.phase\s*=\s*'ready'/);
 	});
 
-	it("eligibility SQL requires needs_tests IS NOT NULL", () => {
-		expect(ELIGIBLE_SQL).toMatch(/needs_tests IS NOT NULL/);
+	it("eligibility SQL requires workflow_id IS NOT NULL", () => {
+		expect(ELIGIBLE_SQL).toMatch(/workflow_id IS NOT NULL/);
 	});
 
 	it("eligibility SQL excludes claimed-and-fresh issues", () => {
@@ -92,7 +93,7 @@ describe("listEligibleWith", () => {
 
 	it("maps row.id to a number even when pg returns a bigint string", async () => {
 		const runner = runnerReturning([
-			{ id: "42" as unknown as number, title: "T", priority: "high", phase: "ready", needs_tests: true },
+			{ id: "42" as unknown as number, title: "T", priority: "high", phase: "ready", needs_tests: true, workflow_id: "tdd" },
 		]);
 		const out = await listEligibleWith(runner, 60);
 		expect(out).toEqual([{ id: 42, title: "T", priority: "high", phase: "ready", status: "ready" }]);
@@ -100,9 +101,9 @@ describe("listEligibleWith", () => {
 
 	it("returns rows in the order the runner yielded them", async () => {
 		const rows: Row[] = [
-			{ id: 11, title: "Critical", priority: "critical", phase: "ready", needs_tests: true },
-			{ id: 12, title: "Medium", priority: "medium", phase: "ready", needs_tests: false },
-			{ id: 10, title: "Low", priority: "low", phase: "ready", needs_tests: true },
+			{ id: 11, title: "Critical", priority: "critical", phase: "ready", needs_tests: true, workflow_id: "tdd" },
+			{ id: 12, title: "Medium", priority: "medium", phase: "ready", needs_tests: false, workflow_id: "direct" },
+			{ id: 10, title: "Low", priority: "low", phase: "ready", needs_tests: true, workflow_id: "tdd" },
 		];
 		const out: IssueListEntry[] = await listEligibleWith(runnerReturning(rows), 60);
 		expect(out.map((r) => r.id)).toEqual([11, 12, 10]);

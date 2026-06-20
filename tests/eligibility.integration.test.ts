@@ -53,11 +53,11 @@ describe.skipIf(!isPostgresAvailable())("ELIGIBLE_SQL", () => {
 		expect(await listEligible(pi, 60)).toEqual([]);
 	});
 
-	it("requires phase='ready' AND needs_tests IS NOT NULL", async () => {
+	it("requires phase='ready' AND workflow_id IS NOT NULL", async () => {
 		const eligibleId = await makeReady("eligible");
-		// drafting issue with correct needs_tests — not yet promoted
+		// Drafting issue with classification — not yet promoted.
 		await issueCreate(pi, { title: "drafting", priority: "high", needs_tests: true });
-		// ready issue without needs_tests classified — picker rejects on the gate
+		// Ready issue without workflow classification — picker rejects on the gate.
 		await issueCreate(pi, { title: "unclassified", priority: "high", phase: "ready" });
 
 		expect((await listEligible(pi, 60)).map((r) => r.id)).toEqual([eligibleId]);

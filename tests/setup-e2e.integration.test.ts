@@ -107,6 +107,7 @@ describe.skipIf(!isPostgresAvailable())("runSetup end-to-end", () => {
 		const configPath = resolve(projectRoot, ".bogstandard/config.json");
 		expect(existsSync(configPath)).toBe(true);
 		const config = JSON.parse(readFileSync(configPath, "utf8"));
+		expect(config.config_version).toBe(1);
 		expect(config.database_url).toBe(dbUrl);
 		expect(config.agent_id).toBe("stage5-test");
 		expect(config.merge).toEqual({

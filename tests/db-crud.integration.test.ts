@@ -194,6 +194,20 @@ describe.skipIf(!isPostgresAvailable())("db.ts CRUD", () => {
 		it("records needs_tests on the v1 row when provided", async () => {
 			const id = await issueCreate(pi, { title: "T", priority: "medium", needs_tests: true });
 			expect((await issueShowJson(pi, id)).needs_tests).toBe(true);
+			expect((await issueShowJson(pi, id)).workflow_id).toBe("tdd");
+		});
+
+		it("records workflow_id and mirrors legacy needs_tests when provided", async () => {
+			const id = await issueCreate(pi, { title: "T", priority: "medium", workflow_id: "direct" });
+			const detail = await issueShowJson(pi, id);
+			expect(detail.workflow_id).toBe("direct");
+			expect(detail.needs_tests).toBe(false);
+		});
+
+		it("rejects conflicting workflow_id and needs_tests", async () => {
+			await expect(
+				issueCreate(pi, { title: "T", priority: "medium", workflow_id: "direct", needs_tests: true }),
+			).rejects.toThrow(/conflicts/);
 		});
 
 		it("records created_by on the v1 row when provided", async () => {
@@ -237,6 +251,15 @@ describe.skipIf(!isPostgresAvailable())("db.ts CRUD", () => {
 			expect(after.title).toBe("T2");
 			expect(after.description).toBe("D");
 			expect(after.needs_tests).toBe(true);
+			expect(after.workflow_id).toBe("tdd");
+		});
+
+		it("updates workflow_id during drafting and mirrors needs_tests", async () => {
+			const id = await issueCreate(pi, { title: "T", priority: "low", needs_tests: true });
+			await issueUpdate(pi, id, { workflow_id: "direct" });
+			const after = await issueShowJson(pi, id);
+			expect(after.workflow_id).toBe("direct");
+			expect(after.needs_tests).toBe(false);
 		});
 
 		it("rejects title/description/needs_tests edits outside drafting", async () => {

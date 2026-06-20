@@ -94,7 +94,7 @@ describe("buildPlanPrompt", () => {
 	});
 
 	it("uses the updated JSON label", () => {
-		expect(buildPlanPrompt(ISSUE)).toContain("Raw JSON (fields: title, description, priority, needs_tests, comments):");
+		expect(buildPlanPrompt(ISSUE)).toContain("Raw JSON (fields: title, description, priority, needs_tests, workflow_id, comments):");
 	});
 });
 
