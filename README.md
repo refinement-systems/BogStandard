@@ -69,6 +69,12 @@ When pulling a BogStandard update that adds new files under `db/migrations/`, br
 bs-migrate           # applies pending schema migrations to the configured DB
 ```
 
+`bs-migrate` does not rewrite `.bogstandard/config.json`. To normalize an existing config file with the current default keys while preserving user-provided values, run:
+
+```bash
+bs-setup --upgrade-config
+```
+
 ## Configuration
 
 The extension and scripts read `.bogstandard/config.json` for the postgres connection. Overrides, highest precedence first:

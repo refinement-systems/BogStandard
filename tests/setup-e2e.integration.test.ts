@@ -110,6 +110,12 @@ describe.skipIf(!isPostgresAvailable())("runSetup end-to-end", () => {
 		expect(config.config_version).toBe(1);
 		expect(config.database_url).toBe(dbUrl);
 		expect(config.agent_id).toBe("stage5-test");
+		expect(config.worker).toEqual({
+			models: {
+				phases: {},
+			},
+			prompts: {},
+		});
 		expect(config.merge).toEqual({
 			test_command: ["npm", "test"],
 			test_timeout_seconds: 600,

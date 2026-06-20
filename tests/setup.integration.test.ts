@@ -19,11 +19,11 @@
  * the integration suite already requires.
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createDatabase, databaseExists, splitDatabaseUrl, writeConfig } from "../scripts/setup.js";
+import { createDatabase, databaseExists, splitDatabaseUrl, upgradeConfig, writeConfig } from "../scripts/setup.js";
 import { dropDatabase, getAdminUrl, isPostgresAvailable, randomDbName } from "./helpers/temp-db.js";
 
 describe("splitDatabaseUrl", () => {
@@ -80,6 +80,12 @@ describe("writeConfig", () => {
 			database_url: "postgres://localhost/foo",
 			agent_id: "alpha",
 			stale_lock_timeout_minutes: 30,
+			worker: {
+				models: {
+					phases: {},
+				},
+				prompts: {},
+			},
 			merge: {
 				test_command: ["npm", "test"],
 				test_timeout_seconds: 600,
@@ -106,6 +112,18 @@ describe("writeConfig", () => {
 		});
 	});
 
+	it("seeds an empty worker config block", () => {
+		const projectRoot = mkdtempSync(join(tmp, "p-"));
+		const path = writeConfig(projectRoot, { databaseUrl: "postgres://localhost/foo" }, false);
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		expect(parsed.worker).toEqual({
+			models: {
+				phases: {},
+			},
+			prompts: {},
+		});
+	});
+
 	it("refuses to overwrite an existing config without force", () => {
 		const projectRoot = mkdtempSync(join(tmp, "p-"));
 		writeConfig(projectRoot, { databaseUrl: "postgres://localhost/foo" }, false);
@@ -129,6 +147,97 @@ describe("writeConfig", () => {
 		expect(existsSync(resolve(projectRoot, ".bogstandard"))).toBe(false);
 		writeConfig(projectRoot, { databaseUrl: "postgres://localhost/foo" }, false);
 		expect(existsSync(resolve(projectRoot, ".bogstandard"))).toBe(true);
+	});
+});
+
+describe("upgradeConfig", () => {
+	let tmp: string;
+
+	beforeAll(() => {
+		tmp = mkdtempSync(join(tmpdir(), "bs-upgrade-config-"));
+	});
+
+	afterAll(() => {
+		rmSync(tmp, { recursive: true, force: true });
+	});
+
+	it("fills missing defaults in an existing config", () => {
+		const projectRoot = mkdtempSync(join(tmp, "p-"));
+		const dir = resolve(projectRoot, ".bogstandard");
+		const path = resolve(dir, "config.json");
+		mkdirSync(dir);
+		writeFileSync(path, `${JSON.stringify({
+			database_url: "postgres://localhost/old",
+			extra_key: "preserved",
+		})}\n`);
+
+		expect(upgradeConfig(projectRoot)).toBe(path);
+
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		expect(parsed).toEqual({
+			database_url: "postgres://localhost/old",
+			extra_key: "preserved",
+			config_version: 1,
+			agent_id: "main",
+			stale_lock_timeout_minutes: 60,
+			worker: {
+				models: {
+					phases: {},
+				},
+				prompts: {},
+			},
+			merge: {
+				test_command: ["npm", "test"],
+				test_timeout_seconds: 600,
+			},
+		});
+	});
+
+	it("preserves existing worker and merge settings while filling missing nested defaults", () => {
+		const projectRoot = mkdtempSync(join(tmp, "p-"));
+		const dir = resolve(projectRoot, ".bogstandard");
+		const path = resolve(dir, "config.json");
+		mkdirSync(dir);
+		writeFileSync(path, `${JSON.stringify({
+			config_version: 1,
+			database_url: "postgres://localhost/custom",
+			agent_id: "custom-agent",
+			stale_lock_timeout_minutes: 12,
+			worker: {
+				models: {
+					plan: "provider/planner",
+				},
+			},
+			merge: {
+				test_command: ["pnpm", "test"],
+				repair_model: "provider/repair",
+			},
+		})}\n`);
+
+		upgradeConfig(projectRoot);
+
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		expect(parsed.agent_id).toBe("custom-agent");
+		expect(parsed.stale_lock_timeout_minutes).toBe(12);
+		expect(parsed.worker.models.plan).toBe("provider/planner");
+		expect(parsed.worker.models.phases).toEqual({});
+		expect(parsed.worker.prompts).toEqual({});
+		expect(parsed.merge.test_command).toEqual(["pnpm", "test"]);
+		expect(parsed.merge.repair_model).toBe("provider/repair");
+		expect(parsed.merge.test_timeout_seconds).toBe(600);
+	});
+
+	it("rejects missing config files", () => {
+		const projectRoot = mkdtempSync(join(tmp, "p-"));
+		expect(() => upgradeConfig(projectRoot)).toThrow(/does not exist/);
+	});
+
+	it("rejects unsupported future config versions", () => {
+		const projectRoot = mkdtempSync(join(tmp, "p-"));
+		const dir = resolve(projectRoot, ".bogstandard");
+		mkdirSync(dir);
+		writeFileSync(resolve(dir, "config.json"), `${JSON.stringify({ config_version: 999 })}\n`);
+		expect(() => upgradeConfig(projectRoot)).toThrow(/Unsupported .*config_version/);
 	});
 });
 

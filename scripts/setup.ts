@@ -20,24 +20,34 @@
  *                    [--agent-id main] \
  *                    [--stale-lock-timeout-minutes 60] \
  *                    [--force]
+ *   npm run setup -- --upgrade-config
  *
  * What it does:
  *   1. Connects to the target database (creating it via the postgres admin DB
  *      if it doesn't exist).
  *   2. Runs db/migrations/0001_init.sql.
- *   3. Writes .bogstandard/config.json with the URL + agent id.
+ *   3. Writes .bogstandard/config.json with the URL + defaults.
  *
  * Idempotent w.r.t. the schema (`CREATE TABLE IF NOT EXISTS`). Refuses to
  * overwrite an existing config.json unless --force is passed.
+ *
+ * --upgrade-config is a file-only path for existing projects: it fills missing
+ * config defaults and preserves user-provided fields.
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import pg from "pg";
-import { CURRENT_CONFIG_VERSION, DEFAULT_MERGE_STAGING_WORKTREE } from "../agent/extensions/bogstandard/config.js";
+import {
+	CURRENT_CONFIG_VERSION,
+	DEFAULT_AGENT_ID,
+	DEFAULT_MERGE_STAGING_WORKTREE,
+	DEFAULT_MERGE_TEST_TIMEOUT_SECONDS,
+	DEFAULT_STALE_LOCK_TIMEOUT_MINUTES,
+} from "../agent/extensions/bogstandard/config.js";
 import { applyMigrations } from "./lib/migrations.js";
 import {
 	isStagingWorktreeRegistered,
@@ -53,10 +63,11 @@ interface Args {
 	agentId?: string;
 	staleLockTimeoutMinutes?: number;
 	force: boolean;
+	upgradeConfig: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-	const out: Args = { force: false };
+	const out: Args = { force: false, upgradeConfig: false };
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
 		const next = () => {
@@ -77,6 +88,9 @@ function parseArgs(argv: string[]): Args {
 			case "--force":
 				out.force = true;
 				break;
+			case "--upgrade-config":
+				out.upgradeConfig = true;
+				break;
 			case "--help":
 			case "-h":
 				printHelp();
@@ -91,10 +105,12 @@ function parseArgs(argv: string[]): Args {
 function printHelp(): void {
 	console.log(
 		`Usage: bs-setup --database-url <url> [--agent-id <id>] [--stale-lock-timeout-minutes <n>] [--force]\n` +
+			`       bs-setup --upgrade-config\n` +
 			`\n` +
 			`Run from the target project's directory. Writes .bogstandard/config.json there.\n` +
 			`Defaults: agent-id=main, stale-lock-timeout-minutes=60.\n` +
-			`The database is created automatically (via the postgres admin DB) if missing.`,
+			`The database is created automatically (via the postgres admin DB) if missing.\n` +
+			`--upgrade-config only fills missing config defaults; it does not touch postgres.`,
 	);
 }
 
@@ -139,29 +155,67 @@ export async function createDatabase(adminUrl: string, dbName: string): Promise<
 	}
 }
 
+type JsonObject = Record<string, unknown>;
+
+function isJsonObject(value: unknown): value is JsonObject {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function ensureObjectField(parent: JsonObject, key: string, path: string): JsonObject {
+	const value = parent[key];
+	if (value === undefined) {
+		const next: JsonObject = {};
+		parent[key] = next;
+		return next;
+	}
+	if (!isJsonObject(value)) {
+		throw new Error(`${path} must be an object in .bogstandard/config.json`);
+	}
+	return value;
+}
+
+function configPath(projectRoot: string): string {
+	return resolve(projectRoot, ".bogstandard/config.json");
+}
+
+function defaultConfigBody(args: {
+	databaseUrl: string;
+	agentId?: string;
+	staleLockTimeoutMinutes?: number;
+}): JsonObject {
+	return {
+		config_version: CURRENT_CONFIG_VERSION,
+		database_url: args.databaseUrl,
+		agent_id: args.agentId ?? DEFAULT_AGENT_ID,
+		stale_lock_timeout_minutes:
+			args.staleLockTimeoutMinutes ?? DEFAULT_STALE_LOCK_TIMEOUT_MINUTES,
+		worker: {
+			models: {
+				phases: {},
+			},
+			prompts: {},
+		},
+		merge: {
+			test_command: ["npm", "test"],
+			test_timeout_seconds: DEFAULT_MERGE_TEST_TIMEOUT_SECONDS,
+		},
+	};
+}
+
 export function writeConfig(
 	projectRoot: string,
 	args: { databaseUrl: string; agentId?: string; staleLockTimeoutMinutes?: number },
 	force: boolean,
 ): string {
 	const dir = resolve(projectRoot, ".bogstandard");
-	const path = resolve(dir, "config.json");
+	const path = configPath(projectRoot);
 	if (existsSync(path) && !force) {
 		throw new Error(
 			`${path} already exists. Re-run with --force to overwrite, or edit it by hand.`,
 		);
 	}
 	mkdirSync(dir, { recursive: true });
-	const body = {
-		config_version: CURRENT_CONFIG_VERSION,
-		database_url: args.databaseUrl,
-		agent_id: args.agentId ?? "main",
-		stale_lock_timeout_minutes: args.staleLockTimeoutMinutes ?? 60,
-		merge: {
-			test_command: ["npm", "test"],
-			test_timeout_seconds: 600,
-		},
-	};
+	const body = defaultConfigBody(args);
 	writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`);
 	console.log(`Wrote ${path}.`);
 	console.log(
@@ -169,6 +223,52 @@ export function writeConfig(
 	);
 	console.log(
 		`  ! If merge repair should run from the daemon without /bs-task model flags, set "worker.models.phases.merge_repair" explicitly.`,
+	);
+	return path;
+}
+
+export function upgradeConfig(projectRoot: string): string {
+	const path = configPath(projectRoot);
+	if (!existsSync(path)) {
+		throw new Error(`${path} does not exist. Run bs-setup first to create it.`);
+	}
+	const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+	if (!isJsonObject(parsed)) {
+		throw new Error(`${path} must contain a JSON object.`);
+	}
+
+	const version = parsed.config_version;
+	if (version === undefined) {
+		parsed.config_version = CURRENT_CONFIG_VERSION;
+	} else if (version !== CURRENT_CONFIG_VERSION) {
+		throw new Error(
+			`Unsupported .bogstandard/config.json config_version ${String(version)}; this BogStandard supports ${CURRENT_CONFIG_VERSION}.`,
+		);
+	}
+
+	if (parsed.agent_id === undefined) parsed.agent_id = DEFAULT_AGENT_ID;
+	if (parsed.stale_lock_timeout_minutes === undefined) {
+		parsed.stale_lock_timeout_minutes = DEFAULT_STALE_LOCK_TIMEOUT_MINUTES;
+	}
+
+	const worker = ensureObjectField(parsed, "worker", "worker");
+	const models = ensureObjectField(worker, "models", "worker.models");
+	ensureObjectField(models, "phases", "worker.models.phases");
+	ensureObjectField(worker, "prompts", "worker.prompts");
+
+	const merge = ensureObjectField(parsed, "merge", "merge");
+	if (merge.test_command === undefined) merge.test_command = ["npm", "test"];
+	if (merge.test_timeout_seconds === undefined) {
+		merge.test_timeout_seconds = DEFAULT_MERGE_TEST_TIMEOUT_SECONDS;
+	}
+
+	writeFileSync(path, `${JSON.stringify(parsed, null, 2)}\n`);
+	console.log(`Upgraded ${path}.`);
+	console.log(
+		`  ! Review "merge.test_command" before running bs-merge-worker.`,
+	);
+	console.log(
+		`  ! Set "worker.models.phases.merge_repair" if merge repair should run from the daemon without /bs-task model flags.`,
 	);
 	return path;
 }
@@ -307,6 +407,12 @@ export async function runSetup(opts: RunSetupOptions): Promise<void> {
 
 async function main(): Promise<void> {
 	const args = parseArgs(process.argv.slice(2));
+	const projectRoot = process.env.BS_PROJECT_ROOT ?? process.cwd();
+	if (args.upgradeConfig) {
+		upgradeConfig(projectRoot);
+		return;
+	}
+
 	const databaseUrl = args.databaseUrl ?? process.env.BOGSTANDARD_DATABASE_URL;
 	if (!databaseUrl) {
 		printHelp();
@@ -315,7 +421,6 @@ async function main(): Promise<void> {
 
 	const scriptDir = dirname(fileURLToPath(import.meta.url));
 	const bogstandardHome = resolve(scriptDir, "..");
-	const projectRoot = process.env.BS_PROJECT_ROOT ?? process.cwd();
 
 	await runSetup({
 		databaseUrl,

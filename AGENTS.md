@@ -37,6 +37,12 @@ The wrapper creates the database if missing, runs `db/migrations/0001_init.sql`,
 | `BOGSTANDARD_AGENT_ID` | `agent_id` | Env override |
 | `.bogstandard/config.json` | `config_version`, `database_url`, `agent_id`, `stale_lock_timeout_minutes`, `worker`, `merge` | Default for the project |
 
+`bs-migrate` updates only the database. To rewrite an existing config file with the current default keys while preserving user-provided values, run:
+
+```bash
+bs-setup --upgrade-config
+```
+
 ## Importing from an existing chainlink project
 
 From the target project's directory:
